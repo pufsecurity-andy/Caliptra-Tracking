@@ -1,4 +1,4 @@
-/* Caliptra 更新追蹤 — 純前端，無相依套件。 */
+/* Caliptra 更新儀表板 — 純前端，無相依套件。 */
 (function () {
   'use strict';
 
@@ -7,12 +7,15 @@
     keyword: 'caliptra',
     extraRepos: [],
     excludeRepos: [],
-    commitsPerRepo: 15,
+    commitsShown: 5,
+    weeks: 8,
+    showReleases: true,
     freshDays: 7,
     staleDays: 30
   }, window.TRACKER_CONFIG || {});
 
   var API = 'https://api.github.com';
+  var WEEK = 7 * 86400000;
   var KEY = {
     cache: 'caliptra-tracker.cache',
     seen: 'caliptra-tracker.seen',
@@ -21,16 +24,16 @@
   };
 
   var state = {
-    repos: [],        // repo 摘要
-    details: {},      // full_name -> { commits, release }
-    expanded: {},     // full_name -> true
+    repos: [],      // repo 摘要
+    data: {},       // full_name -> { pushed_at, commits, commitDates, release }
     fetchedAt: null,
     seenAt: null,
     rate: null,
+    calls: 0,
     busy: false
   };
 
-  /* ---------- localStorage（開無痕或擋 cookie 時要能不炸） ---------- */
+  /* ---------- localStorage（無痕或擋 cookie 時要能不炸） ---------- */
 
   function lsGet(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
   function lsSet(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* ignore */ } }
@@ -55,7 +58,7 @@
     if (!iso) return '—';
     var s = (Date.now() - new Date(iso).getTime()) / 1000;
     if (s < 60) return '剛剛';
-    if (s < 3600) return Math.floor(s / 60) + ' 分鐘前';
+    if (s < 3600) return Math.floor(s / 60) + ' 分前';
     if (s < 86400) return Math.floor(s / 3600) + ' 小時前';
     if (s < 86400 * 30) return Math.floor(s / 86400) + ' 天前';
     if (s < 86400 * 365) return Math.floor(s / 2592000) + ' 個月前';
@@ -93,6 +96,7 @@
     var token = getToken();
     if (token) headers.Authorization = 'Bearer ' + token;
 
+    state.calls++;
     return fetch(url.toString(), { headers: headers }).then(function (res) {
       var remaining = res.headers.get('x-ratelimit-remaining');
       var reset = res.headers.get('x-ratelimit-reset');
@@ -128,21 +132,18 @@
     return {
       full_name: r.full_name,
       name: r.name,
-      html_url: r.html_url,
+      html_url: r.html_url || ('https://github.com/' + r.full_name),
       description: r.description || '',
       default_branch: r.default_branch,
       pushed_at: r.pushed_at,
       stars: r.stargazers_count,
-      archived: !!r.archived,
-      open_count: r.open_issues_count   // GitHub 的這個數字含 issue + PR
+      archived: !!r.archived
     };
   }
 
   function isExcluded(fullName) {
     var name = fullName.split('/')[1];
-    return (CFG.excludeRepos || []).some(function (x) {
-      return x === fullName || x === name;
-    });
+    return (CFG.excludeRepos || []).some(function (x) { return x === fullName || x === name; });
   }
 
   function loadRepoList() {
@@ -186,9 +187,12 @@
     });
   }
 
-  function loadDetail(repo) {
+  // 一個 repo 的更新內容：近 N 週的 commit（1 次 API）＋ 最新 release（1 次 API）
+  function loadRepoData(repo) {
+    var since = new Date(Date.now() - CFG.weeks * WEEK).toISOString();
+
     var commits = gh('/repos/' + repo.full_name + '/commits', {
-      sha: repo.default_branch, per_page: CFG.commitsPerRepo
+      sha: repo.default_branch, since: since, per_page: 100
     }).then(function (list) {
       return list.map(function (c) {
         return {
@@ -201,25 +205,62 @@
       });
     });
 
-    var release = gh('/repos/' + repo.full_name + '/releases', { per_page: 1 })
-      .then(function (list) {
-        if (!list.length) return null;
-        var r = list[0];
-        return { name: r.name || r.tag_name, tag: r.tag_name, url: r.html_url, date: r.published_at };
-      }, function () { return null; });
+    var release = CFG.showReleases
+      ? gh('/repos/' + repo.full_name + '/releases', { per_page: 1 }).then(function (list) {
+          if (!list.length) return null;
+          var r = list[0];
+          return { name: r.name || r.tag_name, tag: r.tag_name, url: r.html_url, date: r.published_at };
+        }, function () { return null; })
+      : Promise.resolve(null);
 
     return Promise.all([commits, release]).then(function (out) {
-      return { commits: out[0], release: out[1] };
+      return {
+        pushed_at: repo.pushed_at,
+        commits: out[0].slice(0, 12),                              // 卡片上顯示用
+        commitDates: out[0].map(function (c) { return c.date; }),  // 活躍度長條圖用
+        truncated: out[0].length >= 100,
+        release: out[1]
+      };
     });
+  }
+
+  /* ---------- 活躍度：把 commit 分到每一週 ---------- */
+
+  function weeklyBuckets(dates) {
+    var n = CFG.weeks;
+    var buckets = new Array(n).fill(0);
+    var now = Date.now();
+    (dates || []).forEach(function (d) {
+      var age = now - new Date(d).getTime();
+      if (age < 0) age = 0;
+      var idx = n - 1 - Math.floor(age / WEEK);   // 最後一格＝本週
+      if (idx >= 0 && idx < n) buckets[idx]++;
+    });
+    return buckets;
+  }
+
+  function sparkline(buckets) {
+    var w = 7, gap = 3, h = 30, max = Math.max.apply(null, buckets.concat([1]));
+    var total = w * buckets.length + gap * (buckets.length - 1);
+    var svg = '<svg class="spark" width="' + total + '" height="' + h + '" viewBox="0 0 ' + total + ' ' + h +
+              '" role="img" aria-label="近 ' + buckets.length + ' 週每週 commit 數">';
+    buckets.forEach(function (v, i) {
+      var x = i * (w + gap);
+      var bh = v === 0 ? 2 : Math.max(3, Math.round(v / max * (h - 2)));
+      var cls = v === 0 ? 'b-zero' : (i === buckets.length - 1 ? 'b-now' : 'b');
+      var weeksAgo = buckets.length - 1 - i;
+      var label = (weeksAgo === 0 ? '本週' : weeksAgo + ' 週前') + '：' + v + ' 個 commit';
+      svg += '<rect class="' + cls + '" x="' + x + '" y="' + (h - bh) + '" width="' + w +
+             '" height="' + bh + '" rx="2"><title>' + esc(label) + '</title></rect>';
+    });
+    return svg + '</svg>';
   }
 
   /* ---------- 快取 ---------- */
 
   function saveCache() {
     lsSet(KEY.cache, JSON.stringify({
-      fetchedAt: state.fetchedAt,
-      repos: state.repos,
-      details: state.details
+      fetchedAt: state.fetchedAt, repos: state.repos, data: state.data
     }));
   }
 
@@ -227,10 +268,10 @@
     var raw = lsGet(KEY.cache);
     if (!raw) return false;
     try {
-      var data = JSON.parse(raw);
-      state.repos = data.repos || [];
-      state.details = data.details || {};
-      state.fetchedAt = data.fetchedAt || null;
+      var c = JSON.parse(raw);
+      state.repos = c.repos || [];
+      state.data = c.data || {};
+      state.fetchedAt = c.fetchedAt || null;
       return state.repos.length > 0;
     } catch (e) { return false; }
   }
@@ -254,16 +295,53 @@
   function renderMeta() {
     var line = $('#meta-line');
     if (!state.fetchedAt) { line.textContent = '尚未抓取資料，按右上角「更新」開始。'; return; }
-    var newCount = state.repos.filter(function (r) { return isNew(r.pushed_at); }).length;
     var shown = visibleRepos().length;
     var count = shown === state.repos.length
       ? ('追蹤 ' + state.repos.length + ' 個 repo')
       : ('顯示 ' + shown + ' / 共 ' + state.repos.length + ' 個 repo');
-    var parts = [count, '資料時間 ' + relTime(state.fetchedAt)];
-    if (state.seenAt) {
-      parts.push(newCount > 0 ? (newCount + ' 個有新更新') : '沒有新更新');
-    }
-    line.textContent = parts.join(' · ');
+    line.textContent = count + ' · 資料時間 ' + relTime(state.fetchedAt);
+  }
+
+  function allCommits() {
+    var out = [];
+    state.repos.forEach(function (r) {
+      var d = state.data[r.full_name];
+      if (d && d.commits) out = out.concat(d.commits);
+    });
+    return out;
+  }
+
+  function renderStats() {
+    var el = $('#stats');
+    if (!state.repos.length) { el.innerHTML = ''; return; }
+
+    var live = state.repos.filter(function (r) { return !r.archived; });
+    var week = Date.now() - WEEK;
+    var commits7 = 0, unread = 0;
+    live.forEach(function (r) {
+      var d = state.data[r.full_name];
+      if (!d) return;
+      (d.commitDates || []).forEach(function (x) {
+        var t = new Date(x).getTime();
+        if (t >= week) commits7++;
+        if (state.seenAt && t > new Date(state.seenAt).getTime()) unread++;
+      });
+    });
+    var active = live.filter(function (r) { return freshness(r.pushed_at) === 'fresh'; }).length;
+    var stale = live.filter(function (r) { return freshness(r.pushed_at) === 'stale'; }).length;
+
+    el.innerHTML =
+      tile('近 7 天 commit', commits7, '所有追蹤 repo 加總', 'hero') +
+      tile('自上次查看以來', unread, unread ? '個新 commit' : '沒有新的', unread ? 'accent' : '') +
+      tile('活躍 repo', active + ' / ' + live.length, CFG.freshDays + ' 天內有更新', '') +
+      tile('久未更新', stale, '超過 ' + CFG.staleDays + ' 天沒動', '');
+  }
+
+  function tile(label, value, sub, kind) {
+    return '<div class="tile ' + (kind || '') + '">' +
+      '<div class="t-label">' + esc(label) + '</div>' +
+      '<div class="t-value">' + esc(value) + '</div>' +
+      '<div class="t-sub">' + esc(sub) + '</div></div>';
   }
 
   function visibleRepos() {
@@ -275,93 +353,93 @@
       if (r.archived && !showArchived) return false;
       if (onlyNew && !isNew(r.pushed_at)) return false;
       if (!q) return true;
-      return (r.full_name + ' ' + r.description).toLowerCase().indexOf(q) !== -1;
+      var d = state.data[r.full_name];
+      var hay = r.full_name + ' ' + r.description + ' ' +
+        (d && d.commits ? d.commits.map(function (c) { return c.title; }).join(' ') : '');
+      return hay.toLowerCase().indexOf(q) !== -1;
     });
 
     var sort = $('#sort').value;
     rows.sort(function (a, b) {
       if (sort === 'name') return a.full_name.localeCompare(b.full_name);
-      if (sort === 'stars') return (b.stars || 0) - (a.stars || 0);
+      if (sort === 'active') {
+        var ca = (state.data[a.full_name] || {}).commitDates || [];
+        var cb = (state.data[b.full_name] || {}).commitDates || [];
+        return cb.length - ca.length;
+      }
       return new Date(b.pushed_at || 0) - new Date(a.pushed_at || 0);
     });
     return rows;
   }
 
-  function detailHtml(repo) {
-    var d = state.details[repo.full_name];
-    if (!d) return '<p class="loading">載入中…</p>';
-    if (d.error) return '<p class="error">' + esc(d.error) + '</p>';
-
-    var html = '';
-
-    if (d.release) {
-      html += '<div class="release">最新 release：' +
-        '<a href="' + esc(d.release.url) + '" target="_blank" rel="noopener">' + esc(d.release.name) + '</a>' +
-        ' <span class="muted">' + relTime(d.release.date) + '</span></div>';
-    }
-
-    if (!d.commits || !d.commits.length) {
-      html += '<p class="muted">沒有抓到 commit。</p>';
-    } else {
-      html += '<ul class="commits">';
-      d.commits.forEach(function (c) {
-        html += '<li class="' + (isNew(c.date) ? 'is-new' : '') + '">' +
-          (isNew(c.date) ? '<span class="tag-new">NEW</span>' : '') +
-          '<a class="c-title" href="' + esc(c.url) + '" target="_blank" rel="noopener">' + esc(c.title) + '</a>' +
-          '<span class="c-meta">' + esc(c.author) + ' · ' + relTime(c.date) +
-          ' · <code>' + esc(c.sha.slice(0, 7)) + '</code></span></li>';
-      });
-      html += '</ul>';
-    }
-
+  function cardHtml(repo) {
+    var d = state.data[repo.full_name] || {};
+    var buckets = weeklyBuckets(d.commitDates);
+    var total = (d.commitDates || []).length;
     var base = 'https://github.com/' + repo.full_name;
-    html += '<div class="links">' +
-      '<a href="' + base + '/commits/' + esc(repo.default_branch) + '" target="_blank" rel="noopener">所有 commit</a>' +
-      '<a href="' + base + '/pulls" target="_blank" rel="noopener">Pull requests</a>' +
-      '<a href="' + base + '/issues" target="_blank" rel="noopener">Issues</a>' +
-      '<a href="' + base + '/releases" target="_blank" rel="noopener">Releases</a>' +
+
+    var head =
+      '<div class="c-head">' +
+        (isNew(repo.pushed_at) ? '<span class="dot" title="有你尚未看過的更新"></span>' : '') +
+        '<a class="c-name" href="' + esc(base) + '" target="_blank" rel="noopener">' + esc(repo.name) + '</a>' +
+        (repo.archived ? '<span class="chip">已封存</span>' : '') +
+        '<span class="c-time f-' + freshness(repo.pushed_at) + '" title="' +
+          (repo.pushed_at ? esc(new Date(repo.pushed_at).toLocaleString('zh-TW')) : '') + '">' +
+          esc(relTime(repo.pushed_at)) + '</span>' +
+      '</div>' +
+      '<p class="c-desc">' + esc(repo.description || '（沒有說明）') + '</p>';
+
+    var stripLabel = total + (d.truncated ? '+' : '') + ' commit';
+    var strip =
+      '<div class="c-strip">' +
+        sparkline(buckets) +
+        '<span class="s-count">近 ' + CFG.weeks + ' 週 <strong>' + esc(stripLabel) + '</strong></span>' +
+        (d.release
+          ? '<a class="chip release" href="' + esc(d.release.url) + '" target="_blank" rel="noopener" title="發佈於 ' +
+            esc(relTime(d.release.date)) + '">' + esc(d.release.tag || d.release.name) + '</a>'
+          : '') +
       '</div>';
 
-    return html;
+    var body;
+    if (d.error) {
+      body = '<p class="c-error">' + esc(d.error) + '</p>';
+    } else if (!d.commits || !d.commits.length) {
+      body = '<p class="c-empty">近 ' + CFG.weeks + ' 週沒有新的 commit。</p>';
+    } else {
+      body = '<ul class="commits">';
+      d.commits.slice(0, CFG.commitsShown).forEach(function (c) {
+        body += '<li>' +
+          (isNew(c.date) ? '<span class="tag-new">NEW</span>' : '<span class="tag-spacer"></span>') +
+          '<a class="c-title" href="' + esc(c.url) + '" target="_blank" rel="noopener" title="' +
+            esc(c.title) + '">' + esc(c.title) + '</a>' +
+          '<span class="c-when">' + esc(relTime(c.date)) + '</span>' +
+        '</li>';
+      });
+      body += '</ul>';
+      if (total > CFG.commitsShown) {
+        body += '<a class="more" href="' + esc(base) + '/commits/' + esc(repo.default_branch) +
+                '" target="_blank" rel="noopener">還有 ' + (total - CFG.commitsShown) +
+                ' 筆，到 GitHub 看全部 →</a>';
+      }
+    }
+
+    return '<article class="card f-' + freshness(repo.pushed_at) + (repo.archived ? ' archived' : '') + '">' +
+      head + strip + body + '</article>';
   }
 
   function render() {
     renderMeta();
-    var list = $('#list');
-    list.textContent = '';
+    renderStats();
 
+    var grid = $('#grid');
     var rows = visibleRepos();
     if (!rows.length) {
-      list.innerHTML = state.repos.length
+      grid.innerHTML = state.repos.length
         ? '<p class="empty">沒有符合條件的 repo。</p>'
         : '<p class="empty">還沒有資料。按右上角「更新」抓取 ' + esc(CFG.org) + ' 底下的 Caliptra repo。</p>';
       return;
     }
-
-    var tpl = $('#tpl-repo');
-    rows.forEach(function (repo) {
-      var node = tpl.content.cloneNode(true);
-      var art = node.querySelector('.repo');
-      art.dataset.repo = repo.full_name;
-      art.classList.add('f-' + freshness(repo.pushed_at));
-      if (repo.archived) art.classList.add('archived');
-
-      node.querySelector('.dot').hidden = !isNew(repo.pushed_at);
-      node.querySelector('.repo-name').textContent = repo.name + (repo.archived ? '（已封存）' : '');
-      node.querySelector('.repo-desc').textContent = repo.description;
-      node.querySelector('.repo-stars').textContent = repo.stars ? '★ ' + repo.stars : '';
-      var t = node.querySelector('.repo-time');
-      t.textContent = relTime(repo.pushed_at);
-      t.title = repo.pushed_at ? new Date(repo.pushed_at).toLocaleString('zh-TW') : '';
-
-      var body = node.querySelector('.repo-body');
-      if (state.expanded[repo.full_name]) {
-        art.classList.add('open');
-        body.hidden = false;
-        body.innerHTML = detailHtml(repo);
-      }
-      list.appendChild(node);
-    });
+    grid.innerHTML = rows.map(cardHtml).join('');
   }
 
   /* ---------- 動作 ---------- */
@@ -371,92 +449,42 @@
     var btn = $('#btn-refresh');
     btn.disabled = on;
     btn.textContent = on ? (label || '抓取中…') : '更新';
-    $('#btn-fetch-all').disabled = on;
   }
 
-  function refresh() {
-    if (state.busy) return;
-    setBusy(true);
-    banner('');
-    loadRepoList().then(function (repos) {
-      state.repos = repos;
-      state.fetchedAt = new Date().toISOString();
-      // repo 已更新過的話，之前抓的 commit 清單就過期了
-      Object.keys(state.details).forEach(function (fn) {
-        var r = repos.filter(function (x) { return x.full_name === fn; })[0];
-        if (!r || state.details[fn].pushed_at !== r.pushed_at) delete state.details[fn];
-      });
-      saveCache();
-      if (!state.seenAt && repos.length) {
-        // 第一次抓取沒有比較基準，就把現在當成基準點，下次更新才看得出哪些是新的
-        state.seenAt = new Date().toISOString();
-        lsSet(KEY.seen, state.seenAt);
-      }
-      render();
-      if (!repos.length) {
-        banner('沒有找到符合條件的 repo，檢查一下 config.js 的 org / keyword。', 'warn');
-        return;
-      }
-      var stale = repos.filter(function (r) {
-        return state.expanded[r.full_name] && !state.details[r.full_name];
-      });
-      if (!stale.length) return;
-      return fetchDetails(stale).then(function () {
-        banner('');
-        saveCache();
-        render();
-      });
-    }).catch(function (err) {
-      banner(errText(err), 'error');
-    }).then(function () { setBusy(false); });
-  }
-
-  function expand(fullName) {
-    var repo = state.repos.filter(function (r) { return r.full_name === fullName; })[0];
-    if (!repo) return Promise.resolve();
-    if (state.details[fullName] && !state.details[fullName].error) { render(); return Promise.resolve(); }
-
-    render(); // 先顯示「載入中」
-    return loadDetail(repo).then(function (d) {
-      d.pushed_at = repo.pushed_at;
-      state.details[fullName] = d;
-      saveCache();
-      render();
-    }).catch(function (err) {
-      state.details[fullName] = { error: errText(err), commits: [] };
-      render();
-    });
-  }
-
-  // 逐一（而非同時）抓取，避免一次打爆 GitHub 的次要速率限制
-  function fetchDetails(targets) {
+  // 逐一（而非同時）抓取，避免踩到 GitHub 的次要速率限制
+  function fetchEach(targets) {
     return new Promise(function (resolve) {
       var i = 0;
       (function step() {
         if (i >= targets.length) { resolve(); return; }
         var repo = targets[i++];
-        state.expanded[repo.full_name] = true;
-        banner('抓取中 ' + i + ' / ' + targets.length + '：' + repo.name, 'info');
         setBusy(true, '抓取中 ' + i + '/' + targets.length);
-        loadDetail(repo).then(function (d) {
-          d.pushed_at = repo.pushed_at;
-          state.details[repo.full_name] = d;
+        banner('讀取更新內容 ' + i + ' / ' + targets.length + '：' + repo.name, 'info');
+        loadRepoData(repo).then(function (d) {
+          state.data[repo.full_name] = d;
         }, function (err) {
-          state.details[repo.full_name] = { error: errText(err), commits: [] };
+          state.data[repo.full_name] = { pushed_at: repo.pushed_at, error: errText(err), commits: [], commitDates: [] };
         }).then(step);
       })();
     });
   }
 
-  function fetchAll() {
-    if (state.busy) return;
-    var rows = visibleRepos();
-    rows.forEach(function (r) { state.expanded[r.full_name] = true; });
-    var targets = rows.filter(function (r) { return !state.details[r.full_name]; });
-    if (!targets.length) { render(); return; }
+  function needsData(repo) {
+    var d = state.data[repo.full_name];
+    return !d || d.error || d.pushed_at !== repo.pushed_at;
+  }
 
+  function wantData(repo) {
+    return !repo.archived || $('#show-archived').checked;
+  }
+
+  // 勾選「顯示已封存」時，補抓那些之前跳過的 repo
+  function fetchMissing() {
+    if (state.busy) return;
+    var targets = state.repos.filter(function (r) { return wantData(r) && needsData(r); });
+    if (!targets.length) return;
     setBusy(true);
-    fetchDetails(targets).then(function () {
+    fetchEach(targets).then(function () {
       banner('');
       saveCache();
       setBusy(false);
@@ -464,8 +492,52 @@
     });
   }
 
+  function refresh() {
+    if (state.busy) return;
+    setBusy(true);
+    banner('');
+    state.calls = 0;
+
+    loadRepoList().then(function (repos) {
+      state.repos = repos;
+      state.fetchedAt = new Date().toISOString();
+      render();
+
+      if (!repos.length) {
+        banner('沒有找到符合條件的 repo，檢查一下 config.js 的 org / keyword。', 'warn');
+        return;
+      }
+
+      // 只重抓「上游真的有動過」的 repo，其餘沿用快取；封存的 repo 不看就不抓
+      var targets = repos.filter(function (r) { return wantData(r) && needsData(r); });
+
+      if (!targets.length) { banner(''); return; }
+
+      return fetchEach(targets).then(function () {
+        banner('更新完成，這次用了 ' + state.calls + ' 次 API。', 'info');
+        setTimeout(function () { banner(''); }, 4000);
+      });
+    }).then(function () {
+      if (!state.seenAt && state.repos.length) {
+        // 第一次抓取沒有比較基準，就把現在當基準點，下次更新才看得出哪些是新的
+        state.seenAt = new Date().toISOString();
+        lsSet(KEY.seen, state.seenAt);
+      }
+      saveCache();
+      render();
+    }).catch(function (err) {
+      banner(errText(err), 'error');
+    }).then(function () { setBusy(false); });
+  }
+
   function markRead() {
-    state.seenAt = new Date().toISOString();
+    // 取「現在」與「已抓到的最新 commit 時間」較晚者，避免對方 commit 時間比本機時鐘快時永遠標成未讀
+    var t = Date.now();
+    allCommits().forEach(function (c) {
+      var d = new Date(c.date).getTime();
+      if (d > t) t = d;
+    });
+    state.seenAt = new Date(t).toISOString();
     lsSet(KEY.seen, state.seenAt);
     render();
   }
@@ -495,10 +567,9 @@
     var hadCache = loadCache();
     render();
     renderRate();
-    if (!hadCache) refresh();   // 第一次進來自動抓一次（只花 1 次 API）
+    if (!hadCache) refresh();
 
     $('#btn-refresh').addEventListener('click', refresh);
-    $('#btn-fetch-all').addEventListener('click', fetchAll);
     $('#btn-mark-read').addEventListener('click', markRead);
     $('#btn-theme').addEventListener('click', toggleTheme);
     $('#btn-settings').addEventListener('click', function () {
@@ -521,19 +592,7 @@
       $(sel).addEventListener('input', render);
       $(sel).addEventListener('change', render);
     });
-
-    $('#list').addEventListener('click', function (e) {
-      var head = e.target.closest('.repo-head');
-      if (!head) return;
-      var fullName = head.closest('.repo').dataset.repo;
-      if (state.expanded[fullName]) {
-        delete state.expanded[fullName];
-        render();
-      } else {
-        state.expanded[fullName] = true;
-        expand(fullName);
-      }
-    });
+    $('#show-archived').addEventListener('change', fetchMissing);
   }
 
   if (document.readyState === 'loading') {

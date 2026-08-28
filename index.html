@@ -3,22 +3,21 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Caliptra 更新追蹤</title>
+<title>Caliptra 更新儀表板</title>
 <link rel="stylesheet" href="styles.css">
 </head>
 <body>
 
 <header class="topbar">
   <div class="brand">
-    <h1>Caliptra 更新追蹤</h1>
+    <h1>Caliptra 更新儀表板</h1>
     <p id="meta-line" class="meta">尚未抓取資料</p>
   </div>
   <div class="actions">
     <button id="btn-refresh" class="primary">更新</button>
-    <button id="btn-fetch-all">抓取全部內容</button>
     <button id="btn-mark-read">標為已讀</button>
-    <button id="btn-settings" class="icon" title="設定">設定</button>
-    <button id="btn-theme" class="icon" title="切換深色 / 淺色">主題</button>
+    <button id="btn-settings" class="ghost" title="設定">設定</button>
+    <button id="btn-theme" class="ghost" title="切換深色 / 淺色">主題</button>
   </div>
 </header>
 
@@ -28,7 +27,7 @@
     未填時 GitHub API 只有 60 次／小時；填入唯讀 token 可提高到 5000 次／小時。
     Token 只存在這台瀏覽器的 localStorage，不會上傳到任何地方，也不會被 commit。
     到 <a href="https://github.com/settings/tokens" target="_blank" rel="noopener">Settings → Tokens</a>
-    建立一個不勾任何 scope 的 token 即可（只讀公開資料）。
+    建立一個不勾任何 scope 的 token 即可。
   </p>
   <div class="row">
     <input id="token" type="password" placeholder="ghp_… 或 github_pat_…" autocomplete="off" spellcheck="false">
@@ -39,38 +38,26 @@
 
 <div id="banner" class="banner" hidden></div>
 
+<section id="stats" class="stats"></section>
+
 <section class="toolbar">
-  <input id="search" type="search" placeholder="搜尋 repo 名稱或說明…" autocomplete="off">
+  <input id="search" type="search" placeholder="搜尋 repo 或 commit 內容…" autocomplete="off">
   <select id="sort" aria-label="排序方式">
     <option value="pushed">最近更新優先</option>
+    <option value="active">近 8 週最活躍</option>
     <option value="name">名稱 A → Z</option>
-    <option value="stars">Star 數</option>
   </select>
   <label class="check"><input id="only-new" type="checkbox"> 只看有新更新</label>
   <label class="check"><input id="show-archived" type="checkbox"> 顯示已封存</label>
 </section>
 
-<main id="list" class="list"></main>
+<main id="grid" class="grid"></main>
 
 <footer class="footer">
   <span id="rate-line"></span>
   <span class="sep">·</span>
   <span>資料來源：GitHub REST API，全部在瀏覽器端執行</span>
 </footer>
-
-<template id="tpl-repo">
-  <article class="repo">
-    <button class="repo-head" type="button">
-      <span class="dot" hidden title="有你尚未看過的更新"></span>
-      <span class="repo-name"></span>
-      <span class="repo-desc"></span>
-      <span class="repo-stars"></span>
-      <span class="repo-time"></span>
-      <span class="chev">▸</span>
-    </button>
-    <div class="repo-body" hidden></div>
-  </article>
-</template>
 
 <script src="config.js"></script>
 <script src="app.js"></script>
