@@ -807,7 +807,7 @@
     state.calls = 0;
 
     var repos = state.repos.filter(function (r) { return !r.archived; });
-    var edges = [], external = [], i = 0;
+    var edges = [], external = [], repoTags = {}, i = 0;
 
     // 1. 讀 .gitmodules 與 Cargo.toml（免費），再逐一問出 submodule 釘住的 commit
     function scanRepo() {
@@ -867,6 +867,7 @@
         return gh('/repos/' + t + '/tags', { per_page: 100 }).then(function (tags) {
           var bySha = {};
           (tags || []).forEach(function (x) { if (x.commit) bySha[x.commit.sha] = x.name; });
+          repoTags[t] = (tags || []).map(function (x) { return x.name; });
           edges.forEach(function (e) {
             if (e.to === t && e.sha && !e.tag && bySha[e.sha]) e.tag = bySha[e.sha];
           });
@@ -902,7 +903,8 @@
         if (d.releases && d.releases[0]) e.latest = d.releases[0].tag;
         else if (d.tags && d.tags[0]) e.latest = d.tags[0].name;
       });
-      state.deps = { analysedAt: new Date().toISOString(), edges: edges, external: external, calls: state.calls };
+      state.deps = { analysedAt: new Date().toISOString(), edges: edges, external: external,
+                     repoTags: repoTags, calls: state.calls };
       lsSet(KEY.deps, JSON.stringify(state.deps));
       banner('相依分析完成，用了 ' + state.calls + ' 次 API。', 'info');
       setTimeout(function () { banner(''); }, 4000);
@@ -922,11 +924,18 @@
 
   // 釘住的 commit 不一定在被比較的分支上 —— 有好幾條是釘在 release 分支。
   // 那種情況說「落後 N」會誤導，要標成分歧並把兩邊各自多出多少講清楚。
-  // 上游已知的版本，新到舊：先 release，再 tag
+  // 上游已知的版本，新到舊：先 release，再 tag，最後補上相依分析時抓到的完整 tag 清單
   function knownVersions(fullName) {
     var d = state.data[fullName] || {};
-    return (d.releases || []).map(function (r) { return r.tag; })
+    var list = (d.releases || []).map(function (r) { return r.tag; })
       .concat((d.tags || []).map(function (t) { return t.name; }));
+    var extra = (state.deps && state.deps.repoTags && state.deps.repoTags[fullName]) || [];
+    extra.forEach(function (t) { if (list.indexOf(t) === -1) list.push(t); });
+    return list;
+  }
+
+  function repoVersion(fullName) {
+    return knownVersions(fullName)[0] || '';
   }
 
   function lagNote(e) {
@@ -972,168 +981,241 @@
 
   /* ---------- 相依關係圖（由分析結果自動排版） ---------- */
 
-  // 分層：沒有往外相依的排最底層，其餘 = 下游最大層數 + 1。遇到環就切斷，不會無限遞迴。
-  function rankNodes(edges) {
-    var nodes = {};
-    edges.forEach(function (e) {
-      nodes[e.from] = nodes[e.from] || { id: e.from, out: [], inn: [] };
-      nodes[e.to] = nodes[e.to] || { id: e.to, out: [], inn: [] };
-    });
-    edges.forEach(function (e) {
-      if (nodes[e.from].out.indexOf(e.to) === -1) nodes[e.from].out.push(e.to);
-      if (nodes[e.to].inn.indexOf(e.from) === -1) nodes[e.to].inn.push(e.from);
-    });
+  // 分層 + 在中間層補虛擬節點，長線才有辦法從節點之間穿過去，
+  // 而不是全部繞到畫布外側把中間塞滿橫線。
+  function layeredLayout(edges) {
+    var GAP = 24, ROW = 104, BH = 44, PAD = 20, DW = 10;
 
+    // 1. 分層：沒有往外相依的排最底層；遇到環就地切斷
+    var ids = {}, out = {};
+    edges.forEach(function (e) {
+      ids[e.from] = 1; ids[e.to] = 1;
+      (out[e.from] = out[e.from] || []).push(e.to);
+    });
     var rank = {}, mark = {};
     function visit(id) {
       if (rank[id] !== undefined) return rank[id];
-      if (mark[id]) return 0;               // 環：就地切斷
+      if (mark[id]) return 0;
       mark[id] = 1;
       var r = 0;
-      nodes[id].out.forEach(function (t) { r = Math.max(r, visit(t) + 1); });
-      rank[id] = r;
-      return r;
+      (out[id] || []).forEach(function (t) { r = Math.max(r, visit(t) + 1); });
+      return (rank[id] = r);
     }
-    Object.keys(nodes).forEach(visit);
-    return { nodes: nodes, rank: rank };
+    Object.keys(ids).forEach(visit);
+    var maxRank = 0;
+    Object.keys(rank).forEach(function (id) { maxRank = Math.max(maxRank, rank[id]); });
+
+    // 2. 建出每一層的成員（真節點 + 虛擬節點）
+    var layers = [], items = {};
+    for (var r = 0; r <= maxRank; r++) layers[r] = [];
+    Object.keys(ids).sort().forEach(function (id) {
+      var it = {
+        key: id, kind: 'node', id: id, rank: rank[id],
+        w: Math.max(124, shortName(id).length * 7.3 + 22),
+        up: [], down: []
+      };
+      items[id] = it;
+      layers[rank[id]].push(it);
+    });
+
+    var chains = [];
+    edges.forEach(function (e, idx) {
+      var a = items[e.from], b = items[e.to];
+      if (!a || !b || a === b) return;
+      var chain = [a], prev = a;
+      for (var r2 = a.rank - 1; r2 > b.rank; r2--) {
+        var d = { key: 'd' + idx + '@' + r2, kind: 'dummy', rank: r2, w: DW, up: [], down: [] };
+        layers[r2].push(d);
+        prev.down.push(d); d.up.push(prev);
+        chain.push(d); prev = d;
+      }
+      prev.down.push(b); b.up.push(prev);
+      chain.push(b);
+      chains.push({ edge: e, chain: chain });
+    });
+
+    // 3. 重心法上下掃，減少交叉
+    function norm(L) { L.forEach(function (it, i) { it.p = L.length > 1 ? i / (L.length - 1) : 0.5; }); }
+    function sweep(dir) {
+      layers.forEach(norm);
+      var rs = [], i;
+      if (dir === 'down') { for (i = maxRank - 1; i >= 0; i--) rs.push(i); }
+      else { for (i = 1; i <= maxRank; i++) rs.push(i); }
+      rs.forEach(function (r3) {
+        var L = layers[r3];
+        L.forEach(function (it) {
+          var ns = dir === 'down' ? it.up : it.down;
+          it.b = ns.length ? ns.reduce(function (a, n) { return a + n.p; }, 0) / ns.length : it.p;
+        });
+        L.sort(function (x, y) { return x.b - y.b; });
+        norm(L);
+      });
+    }
+    for (var k = 0; k < 4; k++) { sweep('down'); sweep('up'); }
+
+    // 4. 先平均攤開，再把長線往直的方向拉
+    var need = 0;
+    layers.forEach(function (L) {
+      var w = L.reduce(function (a, it) { return a + it.w; }, 0) + GAP * Math.max(0, L.length - 1);
+      need = Math.max(need, w);
+    });
+    var W = Math.max(720, need + PAD * 2);
+    layers.forEach(function (L) {
+      var total = L.reduce(function (a, it) { return a + it.w; }, 0) + GAP * Math.max(0, L.length - 1);
+      var x = (W - total) / 2;
+      L.forEach(function (it) { it.cx = x + it.w / 2; x += it.w + GAP; });
+    });
+
+    function straighten(dir) {
+      var rs = [], i;
+      if (dir === 'down') { for (i = maxRank - 1; i >= 0; i--) rs.push(i); }
+      else { for (i = 1; i <= maxRank; i++) rs.push(i); }
+      rs.forEach(function (r4) {
+        var L = layers[r4];
+        L.forEach(function (it) {
+          var ns = dir === 'down' ? it.up : it.down;
+          it.want = ns.length ? ns.reduce(function (a, n) { return a + n.cx; }, 0) / ns.length : it.cx;
+        });
+        var prev = null;
+        L.forEach(function (it) {
+          var min = prev ? prev.cx + prev.w / 2 + GAP + it.w / 2 : PAD + it.w / 2;
+          it.cx = Math.max(min, it.want);
+          prev = it;
+        });
+        for (var j = L.length - 1; j >= 0; j--) {
+          var it2 = L[j], right = L[j + 1], left = L[j - 1];
+          var hi = right ? right.cx - right.w / 2 - GAP - it2.w / 2 : Infinity;
+          var lo = left ? left.cx + left.w / 2 + GAP + it2.w / 2 : PAD + it2.w / 2;
+          it2.cx = Math.min(hi, Math.max(lo, Math.min(it2.want, hi)));
+        }
+      });
+    }
+    for (var t = 0; t < 3; t++) { straighten('down'); straighten('up'); }
+
+    // 拉直那幾輪只會把東西往右推，最後要重新量實際範圍再置中
+    var minX = Infinity, maxX = -Infinity;
+    layers.forEach(function (L) {
+      L.forEach(function (it) {
+        minX = Math.min(minX, it.cx - it.w / 2);
+        maxX = Math.max(maxX, it.cx + it.w / 2);
+      });
+    });
+    var contentW = maxX - minX;
+    W = Math.max(720, contentW + PAD * 2);
+    var shift = (W - contentW) / 2 - minX;
+    layers.forEach(function (L) {
+      L.forEach(function (it) { it.cx += shift; });
+    });
+
+    layers.forEach(function (L) {
+      L.forEach(function (it) { it.y = PAD + (maxRank - it.rank) * ROW; });
+    });
+
+    return {
+      layers: layers, chains: chains, items: items,
+      W: W, H: PAD * 2 + maxRank * ROW + BH, BH: BH
+    };
   }
 
-  // 用重心法排同一層的左右順序，減少線的交叉
-  function orderRanks(nodes, rank) {
-    var rows = [], maxRank = 0;
-    Object.keys(rank).forEach(function (id) { maxRank = Math.max(maxRank, rank[id]); });
-    for (var r = 0; r <= maxRank; r++) rows[r] = [];
-    Object.keys(rank).sort().forEach(function (id) { rows[rank[id]].push(id); });
-
-    function posOf(rows) {
-      var pos = {};
-      rows.forEach(function (row) {
-        row.forEach(function (id, i) { pos[id] = row.length > 1 ? i / (row.length - 1) : 0.5; });
-      });
-      return pos;
+  // 折線轉成有圓角的路徑
+  function roundedPath(pts, r) {
+    if (pts.length < 2) return '';
+    if (pts.length === 2) return 'M' + pts[0].x + ' ' + pts[0].y + ' L' + pts[1].x + ' ' + pts[1].y;
+    var d = 'M' + pts[0].x + ' ' + pts[0].y;
+    for (var i = 1; i < pts.length - 1; i++) {
+      var p = pts[i], a = pts[i - 1], b = pts[i + 1];
+      var d1 = Math.hypot(p.x - a.x, p.y - a.y) || 1;
+      var d2 = Math.hypot(b.x - p.x, b.y - p.y) || 1;
+      var l1 = Math.min(r, d1 / 2), l2 = Math.min(r, d2 / 2);
+      d += ' L' + (p.x + (a.x - p.x) / d1 * l1) + ' ' + (p.y + (a.y - p.y) / d1 * l1) +
+           ' Q' + p.x + ' ' + p.y + ' ' + (p.x + (b.x - p.x) / d2 * l2) + ' ' + (p.y + (b.y - p.y) / d2 * l2);
     }
-    function sortBy(row, neighbours, pos) {
-      var key = {};
-      row.forEach(function (id) {
-        var ns = neighbours(id).filter(function (n) { return pos[n] !== undefined; });
-        key[id] = ns.length
-          ? ns.reduce(function (a, n) { return a + pos[n]; }, 0) / ns.length
-          : pos[id];
-      });
-      row.sort(function (a, b) { return key[a] - key[b] || a.localeCompare(b); });
-    }
-
-    for (var pass = 0; pass < 3; pass++) {
-      var pos = posOf(rows);
-      for (var i = 1; i <= maxRank; i++) {
-        sortBy(rows[i], function (id) { return nodes[id].out; }, pos);
-      }
-      pos = posOf(rows);
-      for (var j = maxRank - 1; j >= 0; j--) {
-        sortBy(rows[j], function (id) { return nodes[id].inn; }, pos);
-      }
-    }
-    return rows;
+    var last = pts[pts.length - 1];
+    return d + ' L' + last.x + ' ' + last.y;
   }
 
   function depsGraphSvg(edges) {
     if (!edges.length) return '';
-
-    var laid = rankNodes(edges);
-    var rows = orderRanks(laid.nodes, laid.rank);
-    var maxRank = rows.length - 1;
-
-    var BW = 170, BH = 44, ROW = 108, GAP = 30;
-    var LANE = 22, RAILS = 4;              // 跨層的線走側邊軌道
-    var SIDE = 30 + RAILS * LANE;          // 左右各留給軌道的寬度
-    var widest = rows.reduce(function (m, r) { return Math.max(m, r.length); }, 1);
-    var W = SIDE * 2 + widest * (BW + GAP) - GAP;
-    var TOP = 14;
-    var H = TOP + (maxRank + 1) * BH + maxRank * (ROW - BH) + 16;
-
-    var xy = {};
-    rows.forEach(function (row, r) {
-      var y = TOP + (maxRank - r) * ROW;
-      var inner = W - SIDE * 2 - BW;
-      row.forEach(function (id, i) {
-        var x = row.length > 1 ? SIDE + inner * i / (row.length - 1) : SIDE + inner / 2;
-        xy[id] = { x: x, y: y, cx: x + BW / 2 };
-      });
+    // 同一對 repo 之間釘同一個版本的重複引用（例如 hw/latest 與 hw/rev-2_1 都指向同一版），
+    // 圖上畫一條就好；釘不同版本的才各畫一條。完整清單在表格那邊。
+    var seen = {}, merged = [];
+    edges.forEach(function (e) {
+      var k = e.from + '>' + e.to + '>' + pinLabel(e) + '>' + edgeState(e).cls;
+      if (seen[k]) { seen[k].dup++; return; }
+      var copy = Object.assign({}, e, { dup: 1 });
+      seen[k] = copy;
+      merged.push(copy);
     });
+    var G = layeredLayout(merged);
+    if (!G.chains.length) return '';
 
-    // 軌道分配：跨越愈多層的走愈外圈，左右交替
-    var multi = edges.filter(function (e) {
-      return xy[e.from] && xy[e.to] && laid.rank[e.from] - laid.rank[e.to] > 1;
-    }).sort(function (a, b) {
-      return (laid.rank[b.from] - laid.rank[b.to]) - (laid.rank[a.from] - laid.rank[a.to]);
-    });
-    var rail = {}, used = [0, 0];
-    multi.forEach(function (e, i) {
-      var side = i % 2;                                  // 0 = 左，1 = 右
-      var slot = used[side]++ % RAILS;
-      rail[e.from + '>' + e.to + '>' + e.ref] = {
-        x: side === 0 ? SIDE - 26 - slot * LANE : W - SIDE + 26 + slot * LANE,
-        // 進出軌道的橫線也要錯開，否則同一排的目標會疊在同一條高度上
-        off: 14 + (i % 5) * 7
-      };
-    });
-
-    var svg = '<svg class="dep-graph" viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="' +
-      esc('相依關係圖：' + Object.keys(xy).length + ' 個 repo、' + edges.length + ' 條相依') + '"><defs>' +
-      ['sync', 'behind', 'diverged', 'unknown'].map(function (k) {
-        return '<marker id="gm-' + k + '" viewBox="0 0 10 10" refX="9.5" refY="5" ' +
+    var svg = '<svg class="dep-graph" viewBox="0 0 ' + Math.round(G.W) + ' ' + Math.round(G.H) +
+      '" role="img" aria-label="' +
+      esc('相依關係圖：' + Object.keys(G.items).length + ' 個 repo、' + G.chains.length + ' 條相依') +
+      '"><defs>' +
+      ['sync', 'behind', 'diverged', 'unknown'].map(function (kk) {
+        return '<marker id="gm-' + kk + '" viewBox="0 0 10 10" refX="9.5" refY="5" ' +
           'markerWidth="8" markerHeight="8" orient="auto-start-reverse">' +
-          '<path class="gm ' + k + '" d="M0.5 1 L9.5 5 L0.5 9 z"/></marker>';
+          '<path class="gm ' + kk + '" d="M0.5 1 L9.5 5 L0.5 9 z"/></marker>';
       }).join('') + '</defs>';
 
-    edges.forEach(function (e) {
-      var a = xy[e.from], b = xy[e.to];
-      if (!a || !b) return;
-      var st = edgeState(e);
-      var pin = pinLabel(e);
-      var tip = esc(shortName(e.from) + ' → ' + shortName(e.to) + '\n' +
-        (e.kind === 'submodule' ? 'submodule ' : 'Cargo ') + e.ref +
-        '\n釘在 ' + pin + '　' + st.label + (st.note ? '\n' + st.note : ''));
-      var y1 = a.y + BH, y2 = b.y;
-      var rl = rail[e.from + '>' + e.to + '>' + e.ref];
-      var d, label;
+    var edgeSvg = '', labels = [];
+    G.chains.forEach(function (c) {
+      var e = c.edge, st = edgeState(e), pin = pinLabel(e);
+      var pts = c.chain.map(function (it, i) {
+        if (i === 0) return { x: it.cx, y: it.y + G.BH };              // 從來源底部出發
+        if (i === c.chain.length - 1) return { x: it.cx, y: it.y };    // 進到目標頂部
+        return { x: it.cx, y: it.y + G.BH / 2 };                       // 穿過中間層
+      });
 
-      if (!rl) {
-        // 相鄰層：直接連過去
-        d = 'M' + a.cx + ' ' + y1 + ' L' + b.cx + ' ' + y2;
-        label = { x: (a.cx + b.cx) / 2, y: (y1 + y2) / 2 + 4, rot: 0 };
-      } else {
-        // 跨層：出來、走軌道、再進去，不穿過中間的節點
-        var e1 = y1 + rl.off, e2 = y2 - rl.off;
-        d = 'M' + a.cx + ' ' + y1 + ' L' + a.cx + ' ' + e1 + ' L' + rl.x + ' ' + e1 +
-            ' L' + rl.x + ' ' + e2 + ' L' + b.cx + ' ' + e2 + ' L' + b.cx + ' ' + y2;
-        label = { x: rl.x, y: (e1 + e2) / 2, rot: -90 };
-      }
+      edgeSvg += '<path class="g-edge ' + st.cls + '" d="' + roundedPath(pts, 14) +
+        '" marker-end="url(#gm-' + st.cls + ')"><title>' +
+        esc(shortName(e.from) + ' → ' + shortName(e.to) + '\n' +
+            (e.kind === 'submodule' ? 'submodule ' : 'Cargo ') + e.ref +
+            (e.dup > 1 ? '（另有 ' + (e.dup - 1) + ' 處引用同一版）' : '') +
+            '\n釘在 ' + pin + '　' + st.label + (st.note ? '\n' + st.note : '')) +
+        '</title></path>';
 
-      svg += '<path class="g-edge ' + st.cls + '" d="' + d + '" marker-end="url(#gm-' + st.cls +
-             ')"><title>' + tip + '</title></path>';
-
-      if (pin && pin !== '—') {
-        var w = pin.length * 6.1 + 10;
-        var g = label.rot
-          ? ' transform="rotate(-90 ' + label.x + ' ' + label.y + ')"'
-          : '';
-        svg += '<g' + g + '><rect class="g-pin-bg" x="' + (label.x - w / 2) + '" y="' +
-               (label.y - 11) + '" width="' + w + '" height="15" rx="4"/>' +
-               '<text class="g-pin ' + st.cls + '" x="' + label.x + '" y="' + label.y +
-               '" text-anchor="middle">' + esc(pin) + '</text></g>';
+      // 只標需要注意的那些，全部都標會糊成一片
+      if (st.cls !== 'sync' && pin && pin !== '—') {
+        var mid = pts.length > 2 ? pts[Math.floor(pts.length / 2)]
+                                 : { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 };
+        labels.push({ x: mid.x, y: mid.y, w: pin.length * 6.1 + 10, text: pin, cls: st.cls });
       }
     });
 
-    Object.keys(xy).forEach(function (id) {
-      var p = xy[id], d = state.data[id] || {};
-      var ver = (d.releases && d.releases[0] && d.releases[0].tag) ||
-                (d.tags && d.tags[0] && d.tags[0].name) || '無版本 tag';
-      svg += '<g class="g-node">' +
-        '<rect class="g-box" x="' + p.x + '" y="' + p.y + '" width="' + BW + '" height="' + BH + '" rx="6"/>' +
-        '<text class="g-name" x="' + (p.x + 11) + '" y="' + (p.y + 19) + '">' + esc(shortName(id)) + '</text>' +
-        '<text class="g-ver" x="' + (p.x + 11) + '" y="' + (p.y + 34) + '">' + esc(ver) + '</text>' +
-        '</g>';
+    // 標籤互相避讓：跟已放好的重疊就上下挪一點
+    labels.forEach(function (L, i) {
+      for (var a = 0; a < 14; a++) {
+        var hit = false;
+        for (var j = 0; j < i; j++) {
+          var o = labels[j];
+          if (Math.abs(L.x - o.x) < (L.w + o.w) / 2 + 5 && Math.abs(L.y - o.y) < 18) { hit = true; break; }
+        }
+        if (!hit) break;
+        L.y += (a % 2 ? -1 : 1) * (11 + a * 4);
+      }
+    });
+
+    svg += edgeSvg + labels.map(function (L) {
+      return '<g class="g-pin-g"><rect class="g-pin-bg" x="' + (L.x - L.w / 2) + '" y="' + (L.y - 8) +
+        '" width="' + L.w + '" height="15" rx="4"/>' +
+        '<text class="g-pin ' + L.cls + '" x="' + L.x + '" y="' + (L.y + 3.5) +
+        '" text-anchor="middle">' + esc(L.text) + '</text></g>';
+    }).join('');
+
+    G.layers.forEach(function (L) {
+      L.forEach(function (it) {
+        if (it.kind !== 'node') return;
+        var ver = repoVersion(it.id) || '沒有 tag';
+        svg += '<g class="g-node"><title>' + esc(shortName(it.id) + '　最新版本：' + ver) + '</title>' +
+          '<rect class="g-box" x="' + (it.cx - it.w / 2) + '" y="' + it.y +
+          '" width="' + it.w + '" height="' + G.BH + '" rx="6"/>' +
+          '<text class="g-name" x="' + it.cx + '" y="' + (it.y + 19) + '" text-anchor="middle">' +
+          esc(shortName(it.id)) + '</text>' +
+          '<text class="g-ver" x="' + it.cx + '" y="' + (it.y + 34) + '" text-anchor="middle">' +
+          esc(ver) + '</text></g>';
+      });
     });
 
     return svg + '</svg>';
@@ -1147,7 +1229,7 @@
       ['unknown', '沒量到']
     ].map(function (x) {
       return '<span class="g-key"><i class="' + x[0] + '"></i>' + esc(x[1]) + '</span>';
-    }).join('') + '<span class="g-hint">線上的字是釘住的版本，滑過去看細節</span></div>';
+    }).join('') + '<span class="g-hint">綠線沒問題所以不標字；其餘標的是釘住的版本，滑過線或節點看細節</span></div>';
   }
 
   function renderDeps() {
