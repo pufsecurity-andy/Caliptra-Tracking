@@ -52,6 +52,18 @@
     <button id="btn-deps" class="primary">分析</button>
     <button id="btn-deps-toggle" class="ghost" hidden>收合</button>
   </div>
+
+  <div class="deps-controls">
+    <label class="ctl">起點
+      <select id="deps-root" aria-label="從哪個 repo 開始展開"></select>
+    </label>
+    <label class="ctl">版本
+      <select id="deps-ref" aria-label="用哪個版本"></select>
+    </label>
+    <span id="deps-mode-hint" class="ctl-hint"></span>
+  </div>
+
+  <div id="deps-filter" class="deps-filter" hidden></div>
   <div id="deps-body" hidden></div>
 </section>
 

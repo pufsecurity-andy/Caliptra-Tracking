@@ -25,6 +25,7 @@
     cache: 'caliptra-tracker.cache',
     diffs: 'caliptra-tracker.diffs',
     deps: 'caliptra-tracker.deps',
+    depsView: 'caliptra-tracker.depsview',
     seen: 'caliptra-tracker.seen',
     token: 'caliptra-tracker.token',
     theme: 'caliptra-tracker.theme'
@@ -37,6 +38,9 @@
     deps: null,      // { analysedAt, edges, external, calls }
     depsRendered: null,
     depsView: 'graph',
+    depsRoot: '',
+    depsRef: '',
+    depsHidden: {},
     diffSeq: 0,
     expandedList: {},// full_name -> true（commit 清單已展開全部）
     fetchedAt: null,
@@ -434,6 +438,12 @@
     } catch (e) { state.diffs = {}; }
 
     try { state.deps = JSON.parse(lsGet(KEY.deps) || 'null'); } catch (e) { state.deps = null; }
+    try {
+      var v = JSON.parse(lsGet(KEY.depsView) || '{}');
+      state.depsRoot = v.root || '';
+      state.depsRef = v.ref || '';
+      state.depsHidden = v.hidden || {};
+    } catch (e) { /* 用預設值 */ }
 
     var cached = lsGet(KEY.cache);
     if (!cached) return false;
@@ -747,10 +757,15 @@
 
   /* ---------- 相依分析 ---------- */
 
-  // .gitmodules 與 Cargo.toml 從 raw.githubusercontent.com 讀，不算 GitHub API 額度
-  function raw(fullName, branch, path) {
-    return fetch(RAW + '/' + fullName + '/' + encodeURIComponent(branch) + '/' + path)
+  // .gitmodules 與 Cargo.toml 從 raw.githubusercontent.com 讀，不算 GitHub API 額度。
+  // ref 可以是分支、tag 或 commit sha，所以「看某個版本綁了什麼」也走同一條路。
+  function raw(fullName, ref, path) {
+    return fetch(RAW + '/' + fullName + '/' + encodeURIComponent(ref) + '/' + path)
       .then(function (res) { return res.ok ? res.text() : null; }, function () { return null; });
+  }
+
+  function shortRef(ref) {
+    return /^[0-9a-f]{40}$/i.test(ref || '') ? ref.slice(0, 7) : (ref || '');
   }
 
   // https://github.com/owner/name(.git) → owner/name
@@ -804,88 +819,106 @@
   function analyseDeps() {
     if (state.busy) return;
     setBusy(true, '分析中…');
+    banner('');
     state.calls = 0;
 
-    var repos = state.repos.filter(function (r) { return !r.archived; });
-    var edges = [], external = [], repoTags = {}, i = 0;
+    var root = state.depsRoot && trackedRepo(state.depsRoot) ? state.depsRoot : '';
+    var rootRef = root ? (state.depsRef || trackedRepo(root).default_branch) : '';
+    var edges = [], external = [], repoTags = {}, shaTag = {}, nodeRefs = {};
+    var scanned = {}, queue = [], MAX = 26;
 
-    // 1. 讀 .gitmodules 與 Cargo.toml（免費），再逐一問出 submodule 釘住的 commit
-    function scanRepo() {
-      if (i >= repos.length) return resolvePins();
-      var r = repos[i++];
-      banner('讀取宣告 ' + i + ' / ' + repos.length + '：' + r.name, 'info');
-      setBusy(true, '分析中 ' + i + '/' + repos.length);
+    if (root) {
+      queue.push({ repo: root, ref: rootRef });
+    } else {
+      state.repos.filter(function (r) { return !r.archived; }).forEach(function (r) {
+        queue.push({ repo: r.full_name, ref: r.default_branch });
+      });
+    }
+
+    function mkEdge(job, to, kind, ref) {
+      return {
+        from: job.repo, fromRef: job.ref, to: to, kind: kind, ref: ref,
+        declaredBranch: '', sha: '', tag: '', behind: null, diverged: null,
+        cmpStatus: '', latest: '', comparedTo: '', error: ''
+      };
+    }
+
+    // 1. 讀宣告（免費），submodule 釘住的 commit 要問 API
+    function scanNext() {
+      if (!queue.length) return Promise.resolve();
+      var job = queue.shift();
+      var key = job.repo + '@' + job.ref;
+      if (scanned[key]) return scanNext();
+      if (Object.keys(scanned).length >= MAX) { queue.length = 0; return Promise.resolve(); }
+      scanned[key] = 1;
+
+      nodeRefs[job.repo] = nodeRefs[job.repo] || [];
+      if (nodeRefs[job.repo].indexOf(job.ref) === -1) nodeRefs[job.repo].push(job.ref);
+
+      banner('讀取 ' + shortName(job.repo) + ' @ ' + shortRef(job.ref) + ' 的相依宣告…', 'info');
+      setBusy(true, '分析中 ' + Object.keys(scanned).length);
 
       return Promise.all([
-        raw(r.full_name, r.default_branch, '.gitmodules'),
-        raw(r.full_name, r.default_branch, 'Cargo.toml')
+        raw(job.repo, job.ref, '.gitmodules'),
+        raw(job.repo, job.ref, 'Cargo.toml')
       ]).then(function (out) {
-        parseGitmodules(out[0]).forEach(function (s) {
-          var target = repoFromUrl(s.url);
-          var edge = {
-            from: r.full_name, to: target || s.url, kind: 'submodule',
-            ref: s.path, declaredBranch: s.branch || '',
-            sha: '', tag: '', behind: null, diverged: null, cmpStatus: '',
-            latest: '', comparedTo: '', error: ''
-          };
-          if (target && trackedRepo(target)) edges.push(edge); else external.push(edge);
+        var subs = parseGitmodules(out[0]);
+        var cargos = parseCargoGit(out[1]);
+
+        return series(subs, function (sm) {
+          var target = repoFromUrl(sm.url);
+          var e = mkEdge(job, target || sm.url, 'submodule', sm.path);
+          e.declaredBranch = sm.branch || '';
+          if (!target || !trackedRepo(target)) { external.push(e); return Promise.resolve(); }
+          edges.push(e);
+          return gh('/repos/' + job.repo + '/contents/' + sm.path, { ref: job.ref })
+            .then(function (c) {
+              if (c && !Array.isArray(c) && c.sha) {
+                e.sha = c.sha;
+                if (root) queue.push({ repo: target, ref: c.sha });
+              } else { e.error = '取不到釘住的 commit'; }
+            }, function (err) { e.error = errText(err); });
+        }).then(function () {
+          cargos.forEach(function (d) {
+            var e = mkEdge(job, d.repo, 'cargo',
+              d.crate + (d.count > 1 ? ' 等 ' + d.count + ' 個 crate' : ''));
+            e.declaredBranch = d.branch; e.sha = d.sha; e.tag = d.tag;
+            if (!trackedRepo(d.repo)) { external.push(e); return; }
+            edges.push(e);
+            if (root && d.sha) queue.push({ repo: d.repo, ref: d.sha });
+          });
         });
-        parseCargoGit(out[1]).forEach(function (d) {
-          var edge = {
-            from: r.full_name, to: d.repo, kind: 'cargo',
-            ref: d.crate + (d.count > 1 ? ' 等 ' + d.count + ' 個 crate' : ''),
-            declaredBranch: d.branch, sha: d.sha, tag: d.tag,
-            behind: null, diverged: null, cmpStatus: '',
-            latest: '', comparedTo: '', error: ''
-          };
-          if (trackedRepo(d.repo)) edges.push(edge); else external.push(edge);
-        });
-      }).then(scanRepo);
+      }).then(scanNext);
     }
 
-    // 2. submodule 釘住的 commit：contents API 回傳 type=submodule 與 sha
-    function resolvePins() {
-      var subs = edges.filter(function (e) { return e.kind === 'submodule'; });
-      var n = 0;
-      return series(subs, function (e) {
-        banner('解析釘住的版本 ' + (++n) + ' / ' + subs.length + '：' + shortName(e.from) + '/' + e.ref, 'info');
-        return gh('/repos/' + e.from + '/contents/' + e.ref).then(function (c) {
-          if (c && !Array.isArray(c) && c.sha) e.sha = c.sha;
-          else e.error = '取不到釘住的 commit';
-        }, function (err) { e.error = errText(err); });
-      }).then(resolveTags);
-    }
-
-    // 3. 把釘住的 commit 對回 tag 名稱（只查有 submodule 指向的 repo）
-    function resolveTags() {
-      var targets = {};
-      edges.forEach(function (e) { if (e.kind === 'submodule' && e.sha) targets[e.to] = 1; });
-      var list = Object.keys(targets);
-
-      return series(list, function (t) {
-        banner('讀取 ' + shortName(t) + ' 的 tag 清單…', 'info');
+    // 2. 每個出現過的 repo 抓 tag 清單：把 commit 對回版本名，也給版本下拉選單用
+    function tagsStep() {
+      var want = {};
+      Object.keys(nodeRefs).forEach(function (r) { want[r] = 1; });
+      edges.forEach(function (e) { want[e.to] = 1; want[e.from] = 1; });
+      return series(Object.keys(want), function (t) {
+        if (!trackedRepo(t)) return Promise.resolve();
+        banner('讀取 ' + shortName(t) + ' 的版本清單…', 'info');
         return gh('/repos/' + t + '/tags', { per_page: 100 }).then(function (tags) {
-          var bySha = {};
-          (tags || []).forEach(function (x) { if (x.commit) bySha[x.commit.sha] = x.name; });
           repoTags[t] = (tags || []).map(function (x) { return x.name; });
+          (tags || []).forEach(function (x) { if (x.commit) shaTag[x.commit.sha] = x.name; });
           edges.forEach(function (e) {
-            if (e.to === t && e.sha && !e.tag && bySha[e.sha]) e.tag = bySha[e.sha];
+            if (e.to === t && e.sha && !e.tag && shaTag[e.sha]) e.tag = shaTag[e.sha];
           });
         }, function () { /* 沒有 tag 就算了 */ });
-      }).then(compareAll);
+      });
     }
 
-    // 4. 每條邊落後上游幾個 commit
-    function compareAll() {
-      var todo = edges.filter(function (e) { return !!e.sha; });
+    // 3. 每條邊離上游多遠
+    function compareStep() {
+      var todo = edges.filter(function (e) { return !!e.sha && trackedRepo(e.to); });
       var n = 0;
       return series(todo, function (e) {
         var target = trackedRepo(e.to);
-        if (!target) return Promise.resolve();
-        // 宣告了分支就跟那條比；拿 v1p6 上的 commit 去跟 main 比會得到沒有意義的數字
         var head = e.declaredBranch || target.default_branch;
         e.comparedTo = head;
-        banner('比對落後量 ' + (++n) + ' / ' + todo.length + '：' + shortName(e.from) + ' → ' + shortName(e.to), 'info');
+        banner('比對落後量 ' + (++n) + ' / ' + todo.length + '：' +
+               shortName(e.from) + ' → ' + shortName(e.to), 'info');
         return gh('/repos/' + e.to + '/compare/' + e.sha + '...' + head, { per_page: 1 })
           .then(function (c) {
             e.behind = typeof c.ahead_by === 'number' ? c.ahead_by : null;
@@ -895,20 +928,24 @@
       });
     }
 
-    return scanRepo().then(function () {
-      // 上游目前的最新版本，用來對照「釘的版本是不是最新的」
+    return scanNext().then(tagsStep).then(compareStep).then(function () {
       edges.forEach(function (e) {
         var d = state.data[e.to];
         if (!d) return;
         if (d.releases && d.releases[0]) e.latest = d.releases[0].tag;
+        else if (repoTags[e.to] && repoTags[e.to][0]) e.latest = repoTags[e.to][0];
         else if (d.tags && d.tags[0]) e.latest = d.tags[0].name;
       });
-      state.deps = { analysedAt: new Date().toISOString(), edges: edges, external: external,
-                     repoTags: repoTags, calls: state.calls };
+      state.deps = {
+        analysedAt: new Date().toISOString(), root: root, rootRef: rootRef,
+        edges: edges, external: external, repoTags: repoTags, shaTag: shaTag,
+        nodeRefs: nodeRefs, calls: state.calls
+      };
       lsSet(KEY.deps, JSON.stringify(state.deps));
-      banner('相依分析完成，用了 ' + state.calls + ' 次 API。', 'info');
+      banner('分析完成，用了 ' + state.calls + ' 次 API。', 'info');
       setTimeout(function () { banner(''); }, 4000);
       $('#deps-body').hidden = false;
+      state.depsRendered = null;
       render();
     }).catch(function (err) {
       banner(errText(err), 'error');
@@ -936,6 +973,31 @@
 
   function repoVersion(fullName) {
     return knownVersions(fullName)[0] || '';
+  }
+
+  function nodeVersionsFull(fullName) {
+    var d = state.deps;
+    if (d && d.root && d.nodeRefs && d.nodeRefs[fullName]) {
+      var seen = {};
+      return d.nodeRefs[fullName].map(function (r) {
+        return (d.shaTag && d.shaTag[r]) || shortRef(r);
+      }).filter(function (v) { if (seen[v]) return false; seen[v] = 1; return true; }).join('、');
+    }
+    return repoVersion(fullName) || '沒有 tag';
+  }
+
+  // 節點上要顯示的版本：指定起點時顯示「這個版本實際綁到的」，否則顯示上游最新版
+  function nodeVersion(fullName) {
+    var d = state.deps;
+    if (d && d.root && d.nodeRefs && d.nodeRefs[fullName]) {
+      var seen = {};
+      var list = d.nodeRefs[fullName].map(function (r) {
+        return (d.shaTag && d.shaTag[r]) || shortRef(r);
+      }).filter(function (v) { if (seen[v]) return false; seen[v] = 1; return true; });
+      if (list.length > 2) return list.slice(0, 2).join(' / ') + ' +' + (list.length - 2);
+      if (list.length) return list.join(' / ');
+    }
+    return repoVersion(fullName) || '沒有 tag';
   }
 
   function lagNote(e) {
@@ -1207,8 +1269,11 @@
     G.layers.forEach(function (L) {
       L.forEach(function (it) {
         if (it.kind !== 'node') return;
-        var ver = repoVersion(it.id) || '沒有 tag';
-        svg += '<g class="g-node"><title>' + esc(shortName(it.id) + '　最新版本：' + ver) + '</title>' +
+        var ver = nodeVersion(it.id);
+        var full = nodeVersionsFull(it.id);
+        svg += '<g class="g-node"><title>' +
+          esc(shortName(it.id) + '\n' + (state.deps && state.deps.root ? '這個版本綁到：' : '最新版本：') + full) +
+          '</title>' +
           '<rect class="g-box" x="' + (it.cx - it.w / 2) + '" y="' + it.y +
           '" width="' + it.w + '" height="' + G.BH + '" rx="6"/>' +
           '<text class="g-name" x="' + it.cx + '" y="' + (it.y + 19) + '" text-anchor="middle">' +
@@ -1232,10 +1297,98 @@
     }).join('') + '<span class="g-hint">綠線沒問題所以不標字；其餘標的是釘住的版本，滑過線或節點看細節</span></div>';
   }
 
+  /* ---------- 起點 / 版本 / 顯示哪些 repo ---------- */
+
+  function depsRootOptions() {
+    return state.repos.filter(function (r) { return !r.archived; })
+      .map(function (r) { return r.full_name; }).sort();
+  }
+
+  function depsRefOptions(root) {
+    var r = trackedRepo(root);
+    if (!r) return [];
+    var seen = {}, out = [];
+    [r.default_branch].concat(knownVersions(root))
+      .concat(state.depsRef ? [state.depsRef] : [])
+      .forEach(function (v) { if (v && !seen[v]) { seen[v] = 1; out.push(v); } });
+    return out;
+  }
+
+  function renderDepsControls() {
+    var rootSel = $('#deps-root'), refSel = $('#deps-ref');
+    var opts = depsRootOptions();
+    var sig = opts.join('|');
+    if (rootSel.dataset.sig !== sig) {
+      rootSel.dataset.sig = sig;
+      rootSel.innerHTML = '<option value="">全部 repo（各自的 main）</option>' +
+        opts.map(function (id) {
+          return '<option value="' + esc(id) + '">' + esc(shortName(id)) + '</option>';
+        }).join('');
+    }
+    rootSel.value = state.depsRoot || '';
+
+    var refs = state.depsRoot ? depsRefOptions(state.depsRoot) : [];
+    var rsig = state.depsRoot + '|' + refs.join('|');
+    if (refSel.dataset.sig !== rsig) {
+      refSel.dataset.sig = rsig;
+      refSel.innerHTML = refs.length
+        ? refs.map(function (v) { return '<option value="' + esc(v) + '">' + esc(v) + '</option>'; }).join('')
+        : '<option value="">—</option>';
+    }
+    refSel.disabled = !state.depsRoot;
+    if (state.depsRoot && !state.depsRef) state.depsRef = refs[0] || '';
+    refSel.value = state.depsRef || '';
+
+    var d = state.deps;
+    var changed = d && (d.root !== (state.depsRoot || '') ||
+                        (state.depsRoot && d.rootRef !== state.depsRef));
+    $('#deps-mode-hint').textContent = changed
+      ? '選擇已變更，按「重新分析」套用'
+      : (state.depsRoot
+          ? '展開這個版本實際綁住的整棵樹'
+          : '每個 repo 各自看 main 上宣告了什麼');
+    $('#deps-mode-hint').classList.toggle('warn', !!changed);
+  }
+
+  function depsNodes(d) {
+    var set = {};
+    d.edges.forEach(function (e) { set[e.from] = 1; set[e.to] = 1; });
+    return Object.keys(set).sort();
+  }
+
+  function renderDepsFilter(d) {
+    var el = $('#deps-filter');
+    var nodes = depsNodes(d);
+    if (!nodes.length) { el.hidden = true; return; }
+    el.hidden = false;
+    var sig = nodes.join('|') + '#' + Object.keys(state.depsHidden).sort().join('|');
+    if (el.dataset.sig === sig) return;
+    el.dataset.sig = sig;
+
+    var hiddenCount = nodes.filter(function (n) { return state.depsHidden[n]; }).length;
+    el.innerHTML = '<span class="f-label">顯示</span>' +
+      nodes.map(function (n) {
+        var on = !state.depsHidden[n];
+        return '<button class="f-chip' + (on ? ' on' : '') + '" type="button" data-hide="' +
+          esc(n) + '" aria-pressed="' + on + '">' + esc(shortName(n)) + '</button>';
+      }).join('') +
+      (hiddenCount
+        ? '<button class="f-all" type="button" data-hide-all="show">全部顯示</button>'
+        : '<button class="f-all" type="button" data-hide-all="hide">全部隱藏</button>');
+  }
+
+  function visibleDepEdges(d) {
+    return d.edges.filter(function (e) {
+      return !state.depsHidden[e.from] && !state.depsHidden[e.to];
+    });
+  }
+
   function renderDeps() {
     var sec = $('#deps');
     if (!CFG.analyseDeps || !state.repos.length) { sec.hidden = true; return; }
     sec.hidden = false;
+
+    renderDepsControls();
 
     var d = state.deps;
     if (!d) {
@@ -1243,13 +1396,18 @@
       $('#btn-deps').textContent = '分析';
       $('#btn-deps-toggle').hidden = true;
       $('.seg-group').hidden = true;
+      $('#deps-filter').hidden = true;
       $('#deps-body').innerHTML = '';
       return;
     }
+    renderDepsFilter(d);
 
-    var drift = d.edges.filter(function (e) { return edgeState(e).cls === 'behind'; }).length;
-    var forked = d.edges.filter(function (e) { return edgeState(e).cls === 'diverged'; }).length;
-    $('#deps-status').textContent = '分析於 ' + relTime(d.analysedAt) + ' · ' + d.edges.length +
+    var shown = visibleDepEdges(d);
+    var drift = shown.filter(function (e) { return edgeState(e).cls === 'behind'; }).length;
+    var forked = shown.filter(function (e) { return edgeState(e).cls === 'diverged'; }).length;
+    $('#deps-status').textContent =
+      (d.root ? shortName(d.root) + ' @ ' + (d.shaTag && d.shaTag[d.rootRef] || shortRef(d.rootRef)) + ' · ' : '') +
+      '分析於 ' + relTime(d.analysedAt) + ' · ' + shown.length +
       ' 條內部相依' +
       (drift || forked
         ? '，其中 ' + (drift ? drift + ' 條可以升版' : '') + (drift && forked ? '、' : '') +
@@ -1260,20 +1418,21 @@
     $('#btn-deps-toggle').hidden = false;
     $('.seg-group').hidden = false;
 
-    var rows = d.edges.slice().sort(function (a, b) {
+    var rows = shown.slice().sort(function (a, b) {
       var rank = function (e) { return { behind: 0, diverged: 1, unknown: 2, sync: 3 }[edgeState(e).cls]; };
       return rank(a) - rank(b) || (b.behind || 0) - (a.behind || 0) || a.from.localeCompare(b.from);
     });
 
     var view = state.depsView || 'graph';
+    var sig = d.analysedAt + '|' + view + '|' + Object.keys(state.depsHidden).sort().join(',');
     var html = '';
 
     if (view === 'graph') {
       html += '<div class="graphwrap">' + depsGraphSvg(rows) + '</div>' + depsLegend();
       if (d.external.length) html += externalHtml(d);
-      if (state.depsRendered !== d.analysedAt + view) {
+      if (state.depsRendered !== sig) {
         $('#deps-body').innerHTML = html;
-        state.depsRendered = d.analysedAt + view;
+        state.depsRendered = sig;
       }
       return;
     }
@@ -1299,9 +1458,9 @@
 
     if (d.external.length) html += externalHtml(d);
 
-    if (state.depsRendered !== d.analysedAt + view) {
+    if (state.depsRendered !== sig) {
       $('#deps-body').innerHTML = html;
-      state.depsRendered = d.analysedAt + view;
+      state.depsRendered = sig;
     }
   }
 
@@ -1508,6 +1667,35 @@
     $('#show-archived').addEventListener('change', fetchMissing);
 
     $('#btn-deps').addEventListener('click', analyseDeps);
+    $('#deps-root').addEventListener('change', function () {
+      state.depsRoot = this.value;
+      state.depsRef = '';
+      lsSet(KEY.depsView, JSON.stringify({ root: state.depsRoot, ref: state.depsRef, hidden: state.depsHidden }));
+      renderDepsControls();
+    });
+    $('#deps-ref').addEventListener('change', function () {
+      state.depsRef = this.value;
+      lsSet(KEY.depsView, JSON.stringify({ root: state.depsRoot, ref: state.depsRef, hidden: state.depsHidden }));
+      renderDepsControls();
+    });
+    $('#deps-filter').addEventListener('click', function (e) {
+      var chip = e.target.closest('[data-hide]');
+      if (chip) {
+        var id = chip.dataset.hide;
+        if (state.depsHidden[id]) delete state.depsHidden[id];
+        else state.depsHidden[id] = 1;
+      } else {
+        var all = e.target.closest('[data-hide-all]');
+        if (!all) return;
+        state.depsHidden = {};
+        if (all.dataset.hideAll === 'hide' && state.deps) {
+          depsNodes(state.deps).forEach(function (n) { state.depsHidden[n] = 1; });
+        }
+      }
+      lsSet(KEY.depsView, JSON.stringify({ root: state.depsRoot, ref: state.depsRef, hidden: state.depsHidden }));
+      $('#deps-filter').dataset.sig = '';
+      render();
+    });
     [['#btn-view-graph', 'graph'], ['#btn-view-table', 'table']].forEach(function (x) {
       $(x[0]).addEventListener('click', function () {
         state.depsView = x[1];
