@@ -43,6 +43,7 @@
     depsRef: '',
     depsHidden: {},
     refCache: {},
+    refError: {},
     refLoading: '',
     diffSeq: 0,
     expandedList: {},// full_name -> true（commit 清單已展開全部）
@@ -162,6 +163,7 @@
   /* ---------- 抓 repo 清單 ---------- */
 
   function normalizeRepo(r) {
+    if (!r || !r.full_name) return null;
     return {
       full_name: r.full_name,
       name: r.name,
@@ -174,7 +176,7 @@
   }
 
   function isExcluded(fullName) {
-    var name = fullName.split('/')[1];
+    var name = String(fullName || '').split('/')[1];
     return (CFG.excludeRepos || []).some(function (x) { return x === fullName || x === name; });
   }
 
@@ -214,7 +216,10 @@
         return gh('/repos/' + fn).then(normalizeRepo, function () { return null; });
       })).then(function (results) {
         results.forEach(function (r) { if (r) picked.push(r); });
-        return picked.filter(function (r) { return !isExcluded(r.full_name); });
+        // 回應長得不對就整筆丟掉，不要讓一筆壞資料打斷整次更新
+        return picked.filter(function (r) {
+          return r && r.full_name && r.name && !isExcluded(r.full_name);
+        });
       });
     });
   }
@@ -448,6 +453,10 @@
       state.depsHidden = v.hidden || {};
     } catch (e) { /* 用預設值 */ }
     try { state.refCache = JSON.parse(lsGet(KEY.refs) || '{}'); } catch (e) { state.refCache = {}; }
+    // 之前版本可能存進失敗的空清單，開檔時先清掉
+    Object.keys(state.refCache).forEach(function (k) {
+      if (!refsUsable(k)) delete state.refCache[k];
+    });
 
     var cached = lsGet(KEY.cache);
     if (!cached) return false;
@@ -1314,19 +1323,39 @@
 
   // 版本清單直接跟 GitHub 要，不靠卡片那邊的快取 —— 這些 repo 多半只打 tag、沒發 release，
   // 卡片的 tags 又只在 releases 為空時才補抓，湊出來的清單會缺東西。
-  function loadRefsFor(root) {
-    if (!root || state.refCache[root] || state.refLoading) return Promise.resolve();
+  //
+  // 任何 repo 至少有一條分支，所以 branches 是空的一定是抓失敗（額度用完之類），
+  // 不可能是真的沒有。用這個判斷就不會把失敗的結果當成有效快取存起來卡死。
+  function refsUsable(root) {
+    var c = state.refCache[root];
+    return !!(c && c.branches && c.branches.length);
+  }
+
+  function loadRefsFor(root, force) {
+    if (!root) return Promise.resolve();
+    if (!force && refsUsable(root)) return Promise.resolve();
+    if (state.refLoading === root) return Promise.resolve();
+
     state.refLoading = root;
+    delete state.refError[root];
     renderDepsControls();
-    return Promise.all([
-      gh('/repos/' + root + '/tags', { per_page: 100 })
-        .then(function (l) { return (l || []).map(function (x) { return x.name; }); }, function () { return []; }),
-      gh('/repos/' + root + '/branches', { per_page: 100 })
-        .then(function (l) { return (l || []).map(function (x) { return x.name; }); }, function () { return []; })
-    ]).then(function (out) {
-      state.refCache[root] = { tags: out[0], branches: out[1] };
-      lsSet(KEY.refs, JSON.stringify(state.refCache));
-    }).then(function () {
+
+    var failed = [];
+    function list(path) {
+      return gh('/repos/' + root + '/' + path, { per_page: 100 }).then(
+        function (l) { return (l || []).map(function (x) { return x.name; }); },
+        function (err) { failed.push(errText(err)); return null; }
+      );
+    }
+
+    return Promise.all([list('tags'), list('branches')]).then(function (out) {
+      if (out[1] === null) {
+        state.refError[root] = failed[0] || '讀不到版本清單';
+        delete state.refCache[root];
+      } else {
+        state.refCache[root] = { tags: out[0] || [], branches: out[1] };
+        lsSet(KEY.refs, JSON.stringify(state.refCache));
+      }
       state.refLoading = '';
       renderDepsControls();
       renderRate();
@@ -1338,11 +1367,15 @@
     if (!r) return null;
     var cached = state.refCache[root] || { tags: [], branches: [] };
     var dflt = r.default_branch;
+    // 版本清單抓不到時，至少用相依分析當時抓到的 tag 頂著
+    var tags = cached.tags.length ? cached.tags
+      : ((state.deps && state.deps.repoTags && state.deps.repoTags[root]) || []);
     return {
       dflt: dflt,
-      tags: cached.tags.filter(function (t) { return t !== dflt; }),
+      tags: tags.filter(function (t) { return t !== dflt; }),
       branches: cached.branches.filter(function (b) { return b !== dflt; }),
-      loaded: !!state.refCache[root]
+      ok: refsUsable(root),
+      error: state.refError[root] || ''
     };
   }
 
@@ -1383,7 +1416,7 @@
           html += '<optgroup label="分支（' + g.branches.length + '）">' +
             g.branches.map(function (b) { return opt(b); }).join('') + '</optgroup>';
         }
-        if (!g.loaded && state.refLoading !== state.depsRoot) {
+        if (!g.ok && !g.tags.length && state.refLoading !== state.depsRoot) {
           html += opt('', '（版本清單還沒載入）');
         }
         refSel.innerHTML = html;
@@ -1396,12 +1429,19 @@
     var d = state.deps;
     var changed = d && (d.root !== (state.depsRoot || '') ||
                         (state.depsRoot && d.rootRef !== state.depsRef));
+    var err = g && g.error;
     $('#deps-mode-hint').textContent =
       state.refLoading === state.depsRoot && state.depsRoot ? '讀取版本清單…'
+      : err ? '版本清單讀不到：' + err
       : changed ? '選擇已變更，按「重新分析」套用'
       : state.depsRoot ? '展開這個版本實際綁住的整棵樹'
       : '每個 repo 各自看 main 上宣告了什麼';
-    $('#deps-mode-hint').classList.toggle('warn', !!changed);
+    $('#deps-mode-hint').classList.toggle('warn', !!(changed || err));
+
+    var reload = $('#btn-refs-reload');
+    reload.hidden = !state.depsRoot || state.refLoading === state.depsRoot ||
+                    (g && g.ok && (g.tags.length || g.branches.length));
+    reload.textContent = err ? '重試' : '載入版本清單';
   }
 
   function depsNodes(d) {
@@ -1719,7 +1759,10 @@
       $(sel).addEventListener('change', render);
     });
     $('#show-archived').addEventListener('change', fetchMissing);
-    if (state.depsRoot && !state.refCache[state.depsRoot]) {
+    $('#btn-refs-reload').addEventListener('click', function () {
+      loadRefsFor(state.depsRoot, true);
+    });
+    if (state.depsRoot && !refsUsable(state.depsRoot)) {
       setTimeout(function () { loadRefsFor(state.depsRoot); }, 1200);
     }
 
