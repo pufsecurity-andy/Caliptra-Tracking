@@ -824,7 +824,8 @@
           var edge = {
             from: r.full_name, to: target || s.url, kind: 'submodule',
             ref: s.path, declaredBranch: s.branch || '',
-            sha: '', tag: '', behind: null, latest: '', comparedTo: '', error: ''
+            sha: '', tag: '', behind: null, diverged: null, cmpStatus: '',
+            latest: '', comparedTo: '', error: ''
           };
           if (target && trackedRepo(target)) edges.push(edge); else external.push(edge);
         });
@@ -833,7 +834,8 @@
             from: r.full_name, to: d.repo, kind: 'cargo',
             ref: d.crate + (d.count > 1 ? ' 等 ' + d.count + ' 個 crate' : ''),
             declaredBranch: d.branch, sha: d.sha, tag: d.tag,
-            behind: null, latest: '', comparedTo: '', error: ''
+            behind: null, diverged: null, cmpStatus: '',
+            latest: '', comparedTo: '', error: ''
           };
           if (trackedRepo(d.repo)) edges.push(edge); else external.push(edge);
         });
@@ -883,8 +885,11 @@
         e.comparedTo = head;
         banner('比對落後量 ' + (++n) + ' / ' + todo.length + '：' + shortName(e.from) + ' → ' + shortName(e.to), 'info');
         return gh('/repos/' + e.to + '/compare/' + e.sha + '...' + head, { per_page: 1 })
-          .then(function (c) { e.behind = typeof c.ahead_by === 'number' ? c.ahead_by : null; },
-                function (err) { if (!e.error) e.error = errText(err); });
+          .then(function (c) {
+            e.behind = typeof c.ahead_by === 'number' ? c.ahead_by : null;
+            e.diverged = typeof c.behind_by === 'number' ? c.behind_by : null;
+            e.cmpStatus = c.status || '';
+          }, function (err) { if (!e.error) e.error = errText(err); });
       });
     }
 
@@ -914,21 +919,32 @@
     }, Promise.resolve());
   }
 
-  // 釘 tag 的邊要用版本比，釘 commit 的邊才用 commit 數比。
+  // 釘住的 commit 不一定在被比較的分支上 —— 有好幾條是釘在 release 分支。
+  // 那種情況說「落後 N」會誤導，要標成分歧並把兩邊各自多出多少講清楚。
+  function lagNote(e) {
+    var to = e.comparedTo || 'main';
+    if (e.cmpStatus === 'diverged') {
+      return '釘在另一條分支：' + to + ' 另有 ' + e.behind + ' 個 commit，該分支自己有 ' +
+             e.diverged + ' 個沒進 ' + to;
+    }
+    if (e.behind > 0) return '距 ' + to + ' ' + e.behind + ' 個 commit';
+    return '';
+  }
+
+  // 釘 tag 的邊用版本比，釘 commit 的邊才用 commit 數比。
   // 釘在上游最新的 release 上，即使距離 main 幾百個 commit，也不算落後。
   function edgeState(e) {
     if (e.error) return { cls: 'unknown', label: '?', note: e.error };
-    var lag = e.behind > 0
-      ? '距 ' + (e.comparedTo || 'main') + ' ' + e.behind + ' 個 commit'
-      : '';
+    var note = lagNote(e);
 
     if (e.tag && e.latest) {
       return e.tag === e.latest
-        ? { cls: 'sync', label: '最新版本', note: lag }
-        : { cls: 'behind', label: '可升到 ' + e.latest, note: lag };
+        ? { cls: 'sync', label: '最新版本', note: note }
+        : { cls: 'behind', label: '可升到 ' + e.latest, note: note };
     }
+    if (e.cmpStatus === 'diverged') return { cls: 'diverged', label: '分歧', note: note };
     if (e.behind === 0) return { cls: 'sync', label: '同步', note: '' };
-    if (e.behind > 0) return { cls: 'behind', label: '落後 ' + e.behind, note: lag ? '相對於 ' + (e.comparedTo || 'main') : '' };
+    if (e.behind > 0) return { cls: 'behind', label: '落後 ' + e.behind, note: note };
     return { cls: 'unknown', label: '—', note: '' };
   }
 
@@ -954,14 +970,19 @@
     }
 
     var drift = d.edges.filter(function (e) { return edgeState(e).cls === 'behind'; }).length;
+    var forked = d.edges.filter(function (e) { return edgeState(e).cls === 'diverged'; }).length;
     $('#deps-status').textContent = '分析於 ' + relTime(d.analysedAt) + ' · ' + d.edges.length +
-      ' 條內部相依' + (drift ? '，其中 ' + drift + ' 條落後上游' : '，全部同步') +
+      ' 條內部相依' +
+      (drift || forked
+        ? '，其中 ' + (drift ? drift + ' 條可以升版' : '') + (drift && forked ? '、' : '') +
+          (forked ? forked + ' 條釘在別的分支' : '')
+        : '，全部同步') +
       ' · 這次用了 ' + d.calls + ' 次 API';
     $('#btn-deps').textContent = '重新分析';
     $('#btn-deps-toggle').hidden = false;
 
     var rows = d.edges.slice().sort(function (a, b) {
-      var rank = function (e) { return { behind: 0, unknown: 1, sync: 2 }[edgeState(e).cls]; };
+      var rank = function (e) { return { behind: 0, diverged: 1, unknown: 2, sync: 3 }[edgeState(e).cls]; };
       return rank(a) - rank(b) || (b.behind || 0) - (a.behind || 0) || a.from.localeCompare(b.from);
     });
 
@@ -1022,7 +1043,7 @@
           esc(shortName(e.from) + ' → ' + shortName(e.to) + '：' + e.kind + ' ' + e.ref +
               '，釘在 ' + pinLabel(e) + '，' + st.label) + '">' +
           esc(shortName(pick(e))) + ' <b>' + esc(pinLabel(e)) + '</b>' +
-          (st.cls === 'behind' ? '<i>' + esc(st.label) + '</i>' : '') + '</span>';
+          (st.cls === 'behind' || st.cls === 'diverged' ? '<i>' + esc(st.label) + '</i>' : '') + '</span>';
       }).join('');
     }
 
