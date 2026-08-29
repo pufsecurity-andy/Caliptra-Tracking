@@ -921,6 +921,13 @@
 
   // 釘住的 commit 不一定在被比較的分支上 —— 有好幾條是釘在 release 分支。
   // 那種情況說「落後 N」會誤導，要標成分歧並把兩邊各自多出多少講清楚。
+  // 上游已知的版本，新到舊：先 release，再 tag
+  function knownVersions(fullName) {
+    var d = state.data[fullName] || {};
+    return (d.releases || []).map(function (r) { return r.tag; })
+      .concat((d.tags || []).map(function (t) { return t.name; }));
+  }
+
   function lagNote(e) {
     var to = e.comparedTo || 'main';
     if (e.cmpStatus === 'diverged') {
@@ -937,10 +944,17 @@
     if (e.error) return { cls: 'unknown', label: '?', note: e.error };
     var note = lagNote(e);
 
+    if (e.tag && e.latest && e.tag === e.latest) {
+      return { cls: 'sync', label: '最新版本', note: note };
+    }
+    // 只有在上游的版本清單裡確實看到「釘的這個 tag 排在最新版之後」才敢說可以升版。
+    // 找不到（例如打了 tag 但沒發 release）就退回用 commit 數判斷，不要亂猜方向。
     if (e.tag && e.latest) {
-      return e.tag === e.latest
-        ? { cls: 'sync', label: '最新版本', note: note }
-        : { cls: 'behind', label: '可升到 ' + e.latest, note: note };
+      var known = knownVersions(e.to);
+      var iPin = known.indexOf(e.tag), iLatest = known.indexOf(e.latest);
+      if (iLatest >= 0 && iPin > iLatest) {
+        return { cls: 'behind', label: '可升到 ' + e.latest, note: note };
+      }
     }
     if (e.cmpStatus === 'diverged') return { cls: 'diverged', label: '分歧', note: note };
     if (e.behind === 0) return { cls: 'sync', label: '同步', note: '' };

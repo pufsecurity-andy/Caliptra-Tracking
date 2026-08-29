@@ -441,7 +441,7 @@ body.no-scroll { overflow: hidden; }
 .deps-status { margin: 0; font-size: 12.5px; color: var(--ink-2); flex: 1 1 240px; }
 .deps-head button { flex: none; }
 
-.dep-table { border-collapse: collapse; width: 100%; font-size: 12.5px; min-width: 660px; }
+.dep-table { border-collapse: collapse; width: 100%; font-size: 12.5px; min-width: 780px; }
 .dep-table th, .dep-table td {
   text-align: left; padding: 7px 12px; border-bottom: 1px solid var(--grid); vertical-align: top;
 }
@@ -452,6 +452,7 @@ body.no-scroll { overflow: hidden; }
 .dep-table tbody tr:last-child td { border-bottom: none; }
 .dep-table td.m {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px;
+  white-space: nowrap;   /* repo 名稱不要被折成兩行 */
 }
 .dep-table .sub { display: block; color: var(--muted); font-size: 11px; margin-top: 1px; }
 #deps-body .tablewrap {
