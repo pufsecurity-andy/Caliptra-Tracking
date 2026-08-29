@@ -41,6 +41,16 @@
 
 <section id="stats" class="stats"></section>
 
+<section id="deps" class="deps" hidden>
+  <div class="deps-head">
+    <h2>相依關係</h2>
+    <p id="deps-status" class="deps-status">尚未分析</p>
+    <button id="btn-deps" class="primary">分析</button>
+    <button id="btn-deps-toggle" class="ghost" hidden>收合</button>
+  </div>
+  <div id="deps-body" hidden></div>
+</section>
+
 <section class="toolbar">
   <input id="search" type="search" placeholder="搜尋 repo 或 commit 內容…" autocomplete="off">
   <select id="sort" aria-label="排序方式">

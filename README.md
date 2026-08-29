@@ -38,6 +38,27 @@
 
 **搜尋框搜的是 repo 名稱、說明與 commit 訊息全文**，例如打 `ML-DSA` 就只留下提過它的 repo。
 
+## 相依關係
+
+按上方「相依關係」區塊的「分析」，會讀每個 repo 的 `.gitmodules` 與 `Cargo.toml`，推出誰依賴誰、
+各自釘在哪個版本，並算出離上游有多遠。結果會出現在兩個地方：
+
+- **一張總表**：依賴方 / 被依賴 / 怎麼引用（submodule 路徑或 crate 名）/ 釘在 / 上游最新 / 狀態
+- **每張卡片上兩行**：這個 repo 依賴誰、被誰依賴，以及對方把它釘在哪一版
+
+判斷「有沒有落後」分兩種：
+
+- **釘在 tag** 的（韌體引用硬體多半是這種）：拿釘的 tag 跟上游最新的 release 比。
+  釘在最新版就標「最新版本」，即使它距離 `main` 有幾百個 commit —— 那是刻意的，不算落後。
+- **釘在 commit** 的：用 `compare` 算出離上游幾個 commit。如果 `.gitmodules` 有寫 `branch`，
+  就跟那條分支比而不是預設分支（例如 caliptra-ss 釘的是 i3c-core 的 `v1p6`，跟 `main` 比沒有意義）。
+
+`.gitmodules` 與 `Cargo.toml` 是從 `raw.githubusercontent.com` 讀的，**不算 GitHub API 額度**；
+只有解析釘住的 commit、tag 清單與落後量會用到 API，大約 25～35 次，所以做成按鈕觸發、結果存在瀏覽器裡。
+不想要這個功能就把 `config.js` 的 `analyseDeps` 設成 `false`。
+
+開 DevTools 會看到幾個 404 —— 那是沒有 `.gitmodules` 或 `Cargo.toml` 的 repo，屬於預期內。
+
 ## 設定
 
 改 `config.js`：
@@ -47,12 +68,14 @@ window.TRACKER_CONFIG = {
   org: 'chipsalliance',        // 自動列舉這個 org 底下的 repo
   keyword: 'caliptra',         // 只留名稱含這個關鍵字的（留空字串代表全部）
   extraRepos: [                // 名稱不含關鍵字、或不在上面 org 的，用 owner/name 補上
-    'chipsalliance/adams-bridge',
+    'chipsalliance/adams-bridge',   // caliptra-rtl 的 ML-DSA 加速器
+    'chipsalliance/i3c-core',       // caliptra-sw 與 caliptra-ss 都用，兩邊釘不同版本
+    'chipsalliance/usb2',           // caliptra-ss 的 USB 2.0 IP
   ],
   excludeRepos: [],            // 不想看到的
   commitsShown: 5,             // 每張卡片列幾筆 commit
   weeks: 8,                    // 活躍度長條圖看幾週
-  showReleases: true,          // 顯示最新 release（每個 repo 多花 1 次 API）
+  analyseDeps: true,           // 顯示相依關係區塊
   freshDays: 7,                // 幾天內算「近期有更新」（綠）
   staleDays: 30,               // 超過幾天算「久沒動」（灰）
 };
@@ -72,6 +95,7 @@ GitHub API 不帶 token 是 **每小時 60 次**。這個儀表板要顯示所�
 | 之後按「更新」，都沒動 | 1 |
 | 重新整理頁面（讀快取） | 0 |
 | 點開一筆沒看過的 commit 看 diff | 1（之後再開同一筆是 0） |
+| 按一次「分析相依關係」 | 約 25～35（`.gitmodules` 與 `Cargo.toml` 不算） |
 
 右下角隨時看得到剩餘額度。如果不夠用，到「設定」填一個 GitHub Personal Access Token
 （在 <https://github.com/settings/tokens> 建立，**不用勾任何 scope**），額度會變成 5000 次／小時。

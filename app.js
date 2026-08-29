@@ -15,6 +15,7 @@
   }, window.TRACKER_CONFIG || {});
 
   var API = 'https://api.github.com';
+  var RAW = 'https://raw.githubusercontent.com';
   var WEEK = 7 * 86400000;
   var COMMITS_KEPT = 40;      // 每個 repo 留幾筆 commit 在快取裡
   var DIFF_KEPT = 120;        // 最多快取幾筆 commit 的 diff
@@ -23,6 +24,7 @@
   var KEY = {
     cache: 'caliptra-tracker.cache',
     diffs: 'caliptra-tracker.diffs',
+    deps: 'caliptra-tracker.deps',
     seen: 'caliptra-tracker.seen',
     token: 'caliptra-tracker.token',
     theme: 'caliptra-tracker.theme'
@@ -32,6 +34,8 @@
     repos: [],
     data: {},        // full_name -> { pushed_at, commits, commitDates, releases, tags }
     diffs: {},       // sha -> { files, stats, seq }
+    deps: null,      // { analysedAt, edges, external, calls }
+    depsRendered: null,
     diffSeq: 0,
     expandedList: {},// full_name -> true（commit 清單已展開全部）
     fetchedAt: null,
@@ -428,10 +432,12 @@
       state.diffSeq = d.seq || 0;
     } catch (e) { state.diffs = {}; }
 
-    var raw = lsGet(KEY.cache);
-    if (!raw) return false;
+    try { state.deps = JSON.parse(lsGet(KEY.deps) || 'null'); } catch (e) { state.deps = null; }
+
+    var cached = lsGet(KEY.cache);
+    if (!cached) return false;
     try {
-      var c = JSON.parse(raw);
+      var c = JSON.parse(cached);
       state.repos = c.repos || [];
       state.data = c.data || {};
       state.fetchedAt = c.fetchedAt || null;
@@ -624,12 +630,13 @@
     }
 
     return '<article class="card f-' + freshness(repo.pushed_at) + (repo.archived ? ' archived' : '') + '">' +
-      head + versionHtml(repo) + strip + body + '</article>';
+      head + versionHtml(repo) + depsCardHtml(repo) + strip + body + '</article>';
   }
 
   function render() {
     renderMeta();
     renderStats();
+    renderDeps();
 
     var grid = $('#grid');
     var rows = visibleRepos();
@@ -735,6 +742,296 @@
       '</div><div class="md">' + markdown(rel.body) + '</div>';
 
     openDrawer(repo.name + ' · release', rel.name || rel.tag, html);
+  }
+
+  /* ---------- 相依分析 ---------- */
+
+  // .gitmodules 與 Cargo.toml 從 raw.githubusercontent.com 讀，不算 GitHub API 額度
+  function raw(fullName, branch, path) {
+    return fetch(RAW + '/' + fullName + '/' + encodeURIComponent(branch) + '/' + path)
+      .then(function (res) { return res.ok ? res.text() : null; }, function () { return null; });
+  }
+
+  // https://github.com/owner/name(.git) → owner/name
+  function repoFromUrl(url) {
+    var m = String(url || '').match(/github\.com[/:]([^/]+)\/([^/\s]+?)(?:\.git)?\/?$/i);
+    return m ? m[1] + '/' + m[2] : null;
+  }
+
+  function parseGitmodules(text) {
+    if (!text) return [];
+    var out = [], cur = null;
+    text.split('\n').forEach(function (line) {
+      var head = line.match(/^\s*\[submodule\s+"([^"]*)"\]/);
+      if (head) { cur = { name: head[1], path: '', url: '', branch: '' }; out.push(cur); return; }
+      if (!cur) return;
+      var kv = line.match(/^\s*(path|url|branch)\s*=\s*(.+?)\s*$/);
+      if (kv) cur[kv[1]] = kv[2];
+    });
+    return out.filter(function (s) { return s.path && s.url; });
+  }
+
+  // 抓 Cargo.toml 裡指向 git 的相依。單筆相依不會有巢狀 {}，所以 \{[^}]*\} 夠用。
+  function parseCargoGit(text) {
+    if (!text) return [];
+    var out = [], seen = {}, re = /([A-Za-z0-9_-]+)\s*=\s*\{([^}]*)\}/g, m;
+    while ((m = re.exec(text)) !== null) {
+      var body = m[2];
+      var git = body.match(/\bgit\s*=\s*"([^"]+)"/);
+      if (!git) continue;
+      var repo = repoFromUrl(git[1]);
+      if (!repo) continue;
+      var rev = body.match(/\brev\s*=\s*"([^"]+)"/);
+      var tag = body.match(/\btag\s*=\s*"([^"]+)"/);
+      var br  = body.match(/\bbranch\s*=\s*"([^"]+)"/);
+      var pin = rev ? rev[1] : (tag ? tag[1] : (br ? br[1] : ''));
+      var key = repo + '@' + pin;
+      if (seen[key]) { seen[key].count++; continue; }
+      seen[key] = { crate: m[1], repo: repo, sha: rev ? rev[1] : '', tag: tag ? tag[1] : '',
+                    branch: br ? br[1] : '', count: 1 };
+      out.push(seen[key]);
+    }
+    return out;
+  }
+
+  function trackedRepo(fullName) {
+    return state.repos.filter(function (r) { return r.full_name === fullName; })[0] || null;
+  }
+
+  function shortName(fullName) { return fullName.split('/')[1] || fullName; }
+
+  function analyseDeps() {
+    if (state.busy) return;
+    setBusy(true, '分析中…');
+    state.calls = 0;
+
+    var repos = state.repos.filter(function (r) { return !r.archived; });
+    var edges = [], external = [], i = 0;
+
+    // 1. 讀 .gitmodules 與 Cargo.toml（免費），再逐一問出 submodule 釘住的 commit
+    function scanRepo() {
+      if (i >= repos.length) return resolvePins();
+      var r = repos[i++];
+      banner('讀取宣告 ' + i + ' / ' + repos.length + '：' + r.name, 'info');
+      setBusy(true, '分析中 ' + i + '/' + repos.length);
+
+      return Promise.all([
+        raw(r.full_name, r.default_branch, '.gitmodules'),
+        raw(r.full_name, r.default_branch, 'Cargo.toml')
+      ]).then(function (out) {
+        parseGitmodules(out[0]).forEach(function (s) {
+          var target = repoFromUrl(s.url);
+          var edge = {
+            from: r.full_name, to: target || s.url, kind: 'submodule',
+            ref: s.path, declaredBranch: s.branch || '',
+            sha: '', tag: '', behind: null, latest: '', comparedTo: '', error: ''
+          };
+          if (target && trackedRepo(target)) edges.push(edge); else external.push(edge);
+        });
+        parseCargoGit(out[1]).forEach(function (d) {
+          var edge = {
+            from: r.full_name, to: d.repo, kind: 'cargo',
+            ref: d.crate + (d.count > 1 ? ' 等 ' + d.count + ' 個 crate' : ''),
+            declaredBranch: d.branch, sha: d.sha, tag: d.tag,
+            behind: null, latest: '', comparedTo: '', error: ''
+          };
+          if (trackedRepo(d.repo)) edges.push(edge); else external.push(edge);
+        });
+      }).then(scanRepo);
+    }
+
+    // 2. submodule 釘住的 commit：contents API 回傳 type=submodule 與 sha
+    function resolvePins() {
+      var subs = edges.filter(function (e) { return e.kind === 'submodule'; });
+      var n = 0;
+      return series(subs, function (e) {
+        banner('解析釘住的版本 ' + (++n) + ' / ' + subs.length + '：' + shortName(e.from) + '/' + e.ref, 'info');
+        return gh('/repos/' + e.from + '/contents/' + e.ref).then(function (c) {
+          if (c && !Array.isArray(c) && c.sha) e.sha = c.sha;
+          else e.error = '取不到釘住的 commit';
+        }, function (err) { e.error = errText(err); });
+      }).then(resolveTags);
+    }
+
+    // 3. 把釘住的 commit 對回 tag 名稱（只查有 submodule 指向的 repo）
+    function resolveTags() {
+      var targets = {};
+      edges.forEach(function (e) { if (e.kind === 'submodule' && e.sha) targets[e.to] = 1; });
+      var list = Object.keys(targets);
+
+      return series(list, function (t) {
+        banner('讀取 ' + shortName(t) + ' 的 tag 清單…', 'info');
+        return gh('/repos/' + t + '/tags', { per_page: 100 }).then(function (tags) {
+          var bySha = {};
+          (tags || []).forEach(function (x) { if (x.commit) bySha[x.commit.sha] = x.name; });
+          edges.forEach(function (e) {
+            if (e.to === t && e.sha && !e.tag && bySha[e.sha]) e.tag = bySha[e.sha];
+          });
+        }, function () { /* 沒有 tag 就算了 */ });
+      }).then(compareAll);
+    }
+
+    // 4. 每條邊落後上游幾個 commit
+    function compareAll() {
+      var todo = edges.filter(function (e) { return !!e.sha; });
+      var n = 0;
+      return series(todo, function (e) {
+        var target = trackedRepo(e.to);
+        if (!target) return Promise.resolve();
+        // 宣告了分支就跟那條比；拿 v1p6 上的 commit 去跟 main 比會得到沒有意義的數字
+        var head = e.declaredBranch || target.default_branch;
+        e.comparedTo = head;
+        banner('比對落後量 ' + (++n) + ' / ' + todo.length + '：' + shortName(e.from) + ' → ' + shortName(e.to), 'info');
+        return gh('/repos/' + e.to + '/compare/' + e.sha + '...' + head, { per_page: 1 })
+          .then(function (c) { e.behind = typeof c.ahead_by === 'number' ? c.ahead_by : null; },
+                function (err) { if (!e.error) e.error = errText(err); });
+      });
+    }
+
+    return scanRepo().then(function () {
+      // 上游目前的最新版本，用來對照「釘的版本是不是最新的」
+      edges.forEach(function (e) {
+        var d = state.data[e.to];
+        if (!d) return;
+        if (d.releases && d.releases[0]) e.latest = d.releases[0].tag;
+        else if (d.tags && d.tags[0]) e.latest = d.tags[0].name;
+      });
+      state.deps = { analysedAt: new Date().toISOString(), edges: edges, external: external, calls: state.calls };
+      lsSet(KEY.deps, JSON.stringify(state.deps));
+      banner('相依分析完成，用了 ' + state.calls + ' 次 API。', 'info');
+      setTimeout(function () { banner(''); }, 4000);
+      $('#deps-body').hidden = false;
+      render();
+    }).catch(function (err) {
+      banner(errText(err), 'error');
+    }).then(function () { setBusy(false); });
+  }
+
+  // 逐一執行，不並發
+  function series(items, fn) {
+    return items.reduce(function (p, item) {
+      return p.then(function () { return fn(item); });
+    }, Promise.resolve());
+  }
+
+  // 釘 tag 的邊要用版本比，釘 commit 的邊才用 commit 數比。
+  // 釘在上游最新的 release 上，即使距離 main 幾百個 commit，也不算落後。
+  function edgeState(e) {
+    if (e.error) return { cls: 'unknown', label: '?', note: e.error };
+    var lag = e.behind > 0
+      ? '距 ' + (e.comparedTo || 'main') + ' ' + e.behind + ' 個 commit'
+      : '';
+
+    if (e.tag && e.latest) {
+      return e.tag === e.latest
+        ? { cls: 'sync', label: '最新版本', note: lag }
+        : { cls: 'behind', label: '可升到 ' + e.latest, note: lag };
+    }
+    if (e.behind === 0) return { cls: 'sync', label: '同步', note: '' };
+    if (e.behind > 0) return { cls: 'behind', label: '落後 ' + e.behind, note: lag ? '相對於 ' + (e.comparedTo || 'main') : '' };
+    return { cls: 'unknown', label: '—', note: '' };
+  }
+
+  function pinLabel(e) {
+    if (e.tag) return e.tag;
+    if (e.sha) return e.sha.slice(0, 7);
+    if (e.declaredBranch) return '分支 ' + e.declaredBranch;
+    return '—';
+  }
+
+  function renderDeps() {
+    var sec = $('#deps');
+    if (!CFG.analyseDeps || !state.repos.length) { sec.hidden = true; return; }
+    sec.hidden = false;
+
+    var d = state.deps;
+    if (!d) {
+      $('#deps-status').textContent = '尚未分析 · 會讀各 repo 的 .gitmodules 與 Cargo.toml';
+      $('#btn-deps').textContent = '分析';
+      $('#btn-deps-toggle').hidden = true;
+      $('#deps-body').innerHTML = '';
+      return;
+    }
+
+    var drift = d.edges.filter(function (e) { return edgeState(e).cls === 'behind'; }).length;
+    $('#deps-status').textContent = '分析於 ' + relTime(d.analysedAt) + ' · ' + d.edges.length +
+      ' 條內部相依' + (drift ? '，其中 ' + drift + ' 條落後上游' : '，全部同步') +
+      ' · 這次用了 ' + d.calls + ' 次 API';
+    $('#btn-deps').textContent = '重新分析';
+    $('#btn-deps-toggle').hidden = false;
+
+    var rows = d.edges.slice().sort(function (a, b) {
+      var rank = function (e) { return { behind: 0, unknown: 1, sync: 2 }[edgeState(e).cls]; };
+      return rank(a) - rank(b) || (b.behind || 0) - (a.behind || 0) || a.from.localeCompare(b.from);
+    });
+
+    var html = '<div class="tablewrap"><table class="dep-table"><thead><tr>' +
+      '<th>依賴方</th><th>被依賴</th><th>怎麼引用</th><th>釘在</th><th>上游最新</th><th>狀態</th>' +
+      '</tr></thead><tbody>';
+
+    rows.forEach(function (e) {
+      var st = edgeState(e);
+      html += '<tr>' +
+        '<td class="m">' + esc(shortName(e.from)) + '</td>' +
+        '<td class="m">' + esc(shortName(e.to)) + '</td>' +
+        '<td>' + (e.kind === 'submodule' ? 'submodule' : 'Cargo') +
+          '<span class="sub">' + esc(e.ref) + (e.declaredBranch ? ' · 宣告分支 ' + esc(e.declaredBranch) : '') + '</span></td>' +
+        '<td class="m">' + esc(pinLabel(e)) + '</td>' +
+        '<td class="m">' + esc(e.latest || '—') + '</td>' +
+        '<td><span class="dep-pill ' + st.cls + '">' + esc(st.label) + '</span>' +
+          (st.note ? '<span class="sub">' + esc(st.note) + '</span>' : '') + '</td>' +
+      '</tr>';
+    });
+    html += '</tbody></table></div>';
+
+    if (d.external.length) {
+      var byRepo = {};
+      d.external.forEach(function (e) { (byRepo[e.to] = byRepo[e.to] || []).push(e); });
+      html += '<details class="ext"><summary>另外還有 ' + Object.keys(byRepo).length +
+        ' 個追蹤清單外的相依（外部專案、不分析）</summary><ul>';
+      Object.keys(byRepo).sort().forEach(function (t) {
+        html += '<li><code>' + esc(t) + '</code> ← ' +
+          byRepo[t].map(function (e) { return esc(shortName(e.from)); }).filter(function (v, i, a) {
+            return a.indexOf(v) === i;
+          }).join('、') + '</li>';
+      });
+      html += '</ul></details>';
+    }
+
+    if (state.depsRendered !== d.analysedAt) {
+      $('#deps-body').innerHTML = html;
+      state.depsRendered = d.analysedAt;
+    }
+  }
+
+  // 卡片上的兩行：往下依賴誰、往上被誰依賴
+  function depsCardHtml(repo) {
+    if (!state.deps) return '';
+    var out = state.deps.edges.filter(function (e) { return e.from === repo.full_name; });
+    var inc = state.deps.edges.filter(function (e) { return e.to === repo.full_name; });
+    if (!out.length && !inc.length) return '';
+
+    function chips(list, pick) {
+      var seen = {};
+      return list.filter(function (e) {
+        var k = pick(e) + '@' + pinLabel(e);
+        if (seen[k]) return false; seen[k] = 1; return true;
+      }).map(function (e) {
+        var st = edgeState(e);
+        return '<span class="dep-chip ' + st.cls + '" title="' +
+          esc(shortName(e.from) + ' → ' + shortName(e.to) + '：' + e.kind + ' ' + e.ref +
+              '，釘在 ' + pinLabel(e) + '，' + st.label) + '">' +
+          esc(shortName(pick(e))) + ' <b>' + esc(pinLabel(e)) + '</b>' +
+          (st.cls === 'behind' ? '<i>' + esc(st.label) + '</i>' : '') + '</span>';
+      }).join('');
+    }
+
+    var html = '<div class="c-deps">';
+    if (out.length) html += '<div class="dep-row"><span class="dep-dir">依賴</span>' +
+      '<span class="dep-chips">' + chips(out, function (e) { return e.to; }) + '</span></div>';
+    if (inc.length) html += '<div class="dep-row"><span class="dep-dir">被依賴</span>' +
+      '<span class="dep-chips">' + chips(inc, function (e) { return e.from; }) + '</span></div>';
+    return html + '</div>';
   }
 
   /* ---------- 動作 ---------- */
@@ -865,6 +1162,7 @@
     $('#token').value = getToken();
 
     var hadCache = loadCache();
+    if (state.deps) $('#deps-body').hidden = false;
     render();
     renderRate();
     if (!hadCache) refresh();
@@ -893,6 +1191,13 @@
       $(sel).addEventListener('change', render);
     });
     $('#show-archived').addEventListener('change', fetchMissing);
+
+    $('#btn-deps').addEventListener('click', analyseDeps);
+    $('#btn-deps-toggle').addEventListener('click', function () {
+      var b = $('#deps-body');
+      b.hidden = !b.hidden;
+      $('#btn-deps-toggle').textContent = b.hidden ? '展開' : '收合';
+    });
 
     $('#grid').addEventListener('click', function (e) {
       var commit = e.target.closest('.c-title');
