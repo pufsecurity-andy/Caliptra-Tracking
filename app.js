@@ -26,6 +26,7 @@
     diffs: 'caliptra-tracker.diffs',
     deps: 'caliptra-tracker.deps',
     depsView: 'caliptra-tracker.depsview',
+    refs: 'caliptra-tracker.refs',
     seen: 'caliptra-tracker.seen',
     token: 'caliptra-tracker.token',
     theme: 'caliptra-tracker.theme'
@@ -41,6 +42,8 @@
     depsRoot: '',
     depsRef: '',
     depsHidden: {},
+    refCache: {},
+    refLoading: '',
     diffSeq: 0,
     expandedList: {},// full_name -> true（commit 清單已展開全部）
     fetchedAt: null,
@@ -444,6 +447,7 @@
       state.depsRef = v.ref || '';
       state.depsHidden = v.hidden || {};
     } catch (e) { /* 用預設值 */ }
+    try { state.refCache = JSON.parse(lsGet(KEY.refs) || '{}'); } catch (e) { state.refCache = {}; }
 
     var cached = lsGet(KEY.cache);
     if (!cached) return false;
@@ -994,8 +998,11 @@
       var list = d.nodeRefs[fullName].map(function (r) {
         return (d.shaTag && d.shaTag[r]) || shortRef(r);
       }).filter(function (v) { if (seen[v]) return false; seen[v] = 1; return true; });
-      if (list.length > 2) return list.slice(0, 2).join(' / ') + ' +' + (list.length - 2);
-      if (list.length) return list.join(' / ');
+      var text = list.length > 2
+        ? list.slice(0, 2).join(' / ') + ' +' + (list.length - 2)
+        : list.join(' / ');
+      if (text.length > 34) text = text.slice(0, 33) + '…';
+      if (text) return text;
     }
     return repoVersion(fullName) || '沒有 tag';
   }
@@ -1071,9 +1078,10 @@
     var layers = [], items = {};
     for (var r = 0; r <= maxRank; r++) layers[r] = [];
     Object.keys(ids).sort().forEach(function (id) {
+      // 寬度要同時容得下名稱與版本字串，否則版本會凸出框外
       var it = {
         key: id, kind: 'node', id: id, rank: rank[id],
-        w: Math.max(124, shortName(id).length * 7.3 + 22),
+        w: Math.max(124, shortName(id).length * 7.3 + 22, nodeVersion(id).length * 6.7 + 22),
         up: [], down: []
       };
       items[id] = it;
@@ -1304,14 +1312,38 @@
       .map(function (r) { return r.full_name; }).sort();
   }
 
-  function depsRefOptions(root) {
+  // 版本清單直接跟 GitHub 要，不靠卡片那邊的快取 —— 這些 repo 多半只打 tag、沒發 release，
+  // 卡片的 tags 又只在 releases 為空時才補抓，湊出來的清單會缺東西。
+  function loadRefsFor(root) {
+    if (!root || state.refCache[root] || state.refLoading) return Promise.resolve();
+    state.refLoading = root;
+    renderDepsControls();
+    return Promise.all([
+      gh('/repos/' + root + '/tags', { per_page: 100 })
+        .then(function (l) { return (l || []).map(function (x) { return x.name; }); }, function () { return []; }),
+      gh('/repos/' + root + '/branches', { per_page: 100 })
+        .then(function (l) { return (l || []).map(function (x) { return x.name; }); }, function () { return []; })
+    ]).then(function (out) {
+      state.refCache[root] = { tags: out[0], branches: out[1] };
+      lsSet(KEY.refs, JSON.stringify(state.refCache));
+    }).then(function () {
+      state.refLoading = '';
+      renderDepsControls();
+      renderRate();
+    });
+  }
+
+  function depsRefGroups(root) {
     var r = trackedRepo(root);
-    if (!r) return [];
-    var seen = {}, out = [];
-    [r.default_branch].concat(knownVersions(root))
-      .concat(state.depsRef ? [state.depsRef] : [])
-      .forEach(function (v) { if (v && !seen[v]) { seen[v] = 1; out.push(v); } });
-    return out;
+    if (!r) return null;
+    var cached = state.refCache[root] || { tags: [], branches: [] };
+    var dflt = r.default_branch;
+    return {
+      dflt: dflt,
+      tags: cached.tags.filter(function (t) { return t !== dflt; }),
+      branches: cached.branches.filter(function (b) { return b !== dflt; }),
+      loaded: !!state.refCache[root]
+    };
   }
 
   function renderDepsControls() {
@@ -1327,26 +1359,48 @@
     }
     rootSel.value = state.depsRoot || '';
 
-    var refs = state.depsRoot ? depsRefOptions(state.depsRoot) : [];
-    var rsig = state.depsRoot + '|' + refs.join('|');
+    var g = state.depsRoot ? depsRefGroups(state.depsRoot) : null;
+    var rsig = state.depsRoot + '|' + (state.refLoading === state.depsRoot ? 'loading' : '') + '|' +
+      (g ? g.dflt + '#' + g.tags.length + '#' + g.branches.length + '#' + (state.depsRef || '') : '');
     if (refSel.dataset.sig !== rsig) {
       refSel.dataset.sig = rsig;
-      refSel.innerHTML = refs.length
-        ? refs.map(function (v) { return '<option value="' + esc(v) + '">' + esc(v) + '</option>'; }).join('')
-        : '<option value="">—</option>';
+      if (!g) {
+        refSel.innerHTML = '<option value="">—</option>';
+      } else {
+        var opt = function (v, label) {
+          return '<option value="' + esc(v) + '">' + esc(label || v) + '</option>';
+        };
+        var html = opt(g.dflt, g.dflt + '（預設分支）');
+        if (state.depsRef && state.depsRef !== g.dflt &&
+            g.tags.indexOf(state.depsRef) === -1 && g.branches.indexOf(state.depsRef) === -1) {
+          html += opt(state.depsRef);
+        }
+        if (g.tags.length) {
+          html += '<optgroup label="tag（' + g.tags.length + '）">' +
+            g.tags.map(function (t) { return opt(t); }).join('') + '</optgroup>';
+        }
+        if (g.branches.length) {
+          html += '<optgroup label="分支（' + g.branches.length + '）">' +
+            g.branches.map(function (b) { return opt(b); }).join('') + '</optgroup>';
+        }
+        if (!g.loaded && state.refLoading !== state.depsRoot) {
+          html += opt('', '（版本清單還沒載入）');
+        }
+        refSel.innerHTML = html;
+      }
     }
-    refSel.disabled = !state.depsRoot;
-    if (state.depsRoot && !state.depsRef) state.depsRef = refs[0] || '';
+    refSel.disabled = !state.depsRoot || state.refLoading === state.depsRoot;
+    if (state.depsRoot && !state.depsRef) state.depsRef = g ? g.dflt : '';
     refSel.value = state.depsRef || '';
 
     var d = state.deps;
     var changed = d && (d.root !== (state.depsRoot || '') ||
                         (state.depsRoot && d.rootRef !== state.depsRef));
-    $('#deps-mode-hint').textContent = changed
-      ? '選擇已變更，按「重新分析」套用'
-      : (state.depsRoot
-          ? '展開這個版本實際綁住的整棵樹'
-          : '每個 repo 各自看 main 上宣告了什麼');
+    $('#deps-mode-hint').textContent =
+      state.refLoading === state.depsRoot && state.depsRoot ? '讀取版本清單…'
+      : changed ? '選擇已變更，按「重新分析」套用'
+      : state.depsRoot ? '展開這個版本實際綁住的整棵樹'
+      : '每個 repo 各自看 main 上宣告了什麼';
     $('#deps-mode-hint').classList.toggle('warn', !!changed);
   }
 
@@ -1665,6 +1719,9 @@
       $(sel).addEventListener('change', render);
     });
     $('#show-archived').addEventListener('change', fetchMissing);
+    if (state.depsRoot && !state.refCache[state.depsRoot]) {
+      setTimeout(function () { loadRefsFor(state.depsRoot); }, 1200);
+    }
 
     $('#btn-deps').addEventListener('click', analyseDeps);
     $('#deps-root').addEventListener('change', function () {
@@ -1672,6 +1729,7 @@
       state.depsRef = '';
       lsSet(KEY.depsView, JSON.stringify({ root: state.depsRoot, ref: state.depsRef, hidden: state.depsHidden }));
       renderDepsControls();
+      loadRefsFor(state.depsRoot);
     });
     $('#deps-ref').addEventListener('change', function () {
       state.depsRef = this.value;

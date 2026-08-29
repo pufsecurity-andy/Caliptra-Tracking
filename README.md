@@ -50,7 +50,8 @@
 
 ### 選一個版本，看它綁住的整棵樹
 
-上方的「起點」選 `caliptra-mcu-sw`、「版本」選 `rt-sdk-2.1.0`，按「重新分析」，
+上方的「起點」選 `caliptra-mcu-sw`，版本選單會去問那個 repo 的 **tag 與分支清單**（分兩組列出，
+各只花 1 次 API 且會快取），選 `rt-sdk-2.1.0` 或某條 release 分支，按「重新分析」，
 會從那個版本往下展開：讀 `raw.githubusercontent.com/<repo>/<那個 tag>/.gitmodules`，
 解出它釘住的 caliptra-sw 是哪個 commit，再用那個 commit 去讀 caliptra-sw 的宣告，一路遞迴下去。
 節點上顯示的就不再是「上游最新版」，而是**那個版本實際綁到的版本**。
