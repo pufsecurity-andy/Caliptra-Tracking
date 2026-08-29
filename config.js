@@ -12,14 +12,14 @@ window.TRACKER_CONFIG = {
   // 不想看到的 repo（owner/name 或只寫 name 都可以）
   excludeRepos: [],
 
-  // 每張卡片直接列出幾筆最新 commit
+  // 每張卡片先列幾筆 commit（其餘按「顯示全部」在頁面內展開）
   commitsShown: 5,
+
+  // 版本區塊列出最近幾個 release
+  releasesShown: 4,
 
   // 活躍度長條圖要看幾週
   weeks: 8,
-
-  // 是否顯示最新 release（每個 repo 多花 1 次 API；額度吃緊時可關掉）
-  showReleases: true,
 
   // 幾天內算「近期有更新」（影響狀態顏色）
   freshDays: 7,

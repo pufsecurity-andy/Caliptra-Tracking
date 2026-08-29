@@ -24,10 +24,11 @@
 <section id="settings" class="panel" hidden>
   <label for="token">GitHub Personal Access Token（選填）</label>
   <p class="hint">
-    未填時 GitHub API 只有 60 次／小時；填入唯讀 token 可提高到 5000 次／小時。
-    Token 只存在這台瀏覽器的 localStorage，不會上傳到任何地方，也不會被 commit。
-    到 <a href="https://github.com/settings/tokens" target="_blank" rel="noopener">Settings → Tokens</a>
-    建立一個不勾任何 scope 的 token 即可。
+    未填時 GitHub API 只有 60 次／小時。要在頁面內看 commit 的完整內容與 diff，每看一筆新的會花 1 次，
+    建議填一個唯讀 token 把額度拉到 5000 次／小時。Token 只存在這台瀏覽器的 localStorage，
+    不會上傳到任何地方，也不會被 commit。到
+    <a href="https://github.com/settings/tokens" target="_blank" rel="noopener">Settings → Tokens</a>
+    建立一個不勾任何 scope 的即可。
   </p>
   <div class="row">
     <input id="token" type="password" placeholder="ghp_… 或 github_pat_…" autocomplete="off" spellcheck="false">
@@ -58,6 +59,20 @@
   <span class="sep">·</span>
   <span>資料來源：GitHub REST API，全部在瀏覽器端執行</span>
 </footer>
+
+<div id="drawer" class="drawer" hidden>
+  <div class="drawer-backdrop" id="drawer-backdrop"></div>
+  <aside class="drawer-panel" role="dialog" aria-modal="true" aria-labelledby="drawer-title">
+    <header class="drawer-head">
+      <div class="drawer-heading">
+        <p class="drawer-eyebrow" id="drawer-eyebrow"></p>
+        <h2 id="drawer-title"></h2>
+      </div>
+      <button id="drawer-close" class="ghost">關閉</button>
+    </header>
+    <div class="drawer-body" id="drawer-body"></div>
+  </aside>
+</div>
 
 <script src="config.js"></script>
 <script src="app.js"></script>
