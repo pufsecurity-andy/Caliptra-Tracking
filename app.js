@@ -36,6 +36,7 @@
     diffs: {},       // sha -> { files, stats, seq }
     deps: null,      // { analysedAt, edges, external, calls }
     depsRendered: null,
+    depsView: 'graph',
     diffSeq: 0,
     expandedList: {},// full_name -> true（commit 清單已展開全部）
     fetchedAt: null,
@@ -969,6 +970,186 @@
     return '—';
   }
 
+  /* ---------- 相依關係圖（由分析結果自動排版） ---------- */
+
+  // 分層：沒有往外相依的排最底層，其餘 = 下游最大層數 + 1。遇到環就切斷，不會無限遞迴。
+  function rankNodes(edges) {
+    var nodes = {};
+    edges.forEach(function (e) {
+      nodes[e.from] = nodes[e.from] || { id: e.from, out: [], inn: [] };
+      nodes[e.to] = nodes[e.to] || { id: e.to, out: [], inn: [] };
+    });
+    edges.forEach(function (e) {
+      if (nodes[e.from].out.indexOf(e.to) === -1) nodes[e.from].out.push(e.to);
+      if (nodes[e.to].inn.indexOf(e.from) === -1) nodes[e.to].inn.push(e.from);
+    });
+
+    var rank = {}, mark = {};
+    function visit(id) {
+      if (rank[id] !== undefined) return rank[id];
+      if (mark[id]) return 0;               // 環：就地切斷
+      mark[id] = 1;
+      var r = 0;
+      nodes[id].out.forEach(function (t) { r = Math.max(r, visit(t) + 1); });
+      rank[id] = r;
+      return r;
+    }
+    Object.keys(nodes).forEach(visit);
+    return { nodes: nodes, rank: rank };
+  }
+
+  // 用重心法排同一層的左右順序，減少線的交叉
+  function orderRanks(nodes, rank) {
+    var rows = [], maxRank = 0;
+    Object.keys(rank).forEach(function (id) { maxRank = Math.max(maxRank, rank[id]); });
+    for (var r = 0; r <= maxRank; r++) rows[r] = [];
+    Object.keys(rank).sort().forEach(function (id) { rows[rank[id]].push(id); });
+
+    function posOf(rows) {
+      var pos = {};
+      rows.forEach(function (row) {
+        row.forEach(function (id, i) { pos[id] = row.length > 1 ? i / (row.length - 1) : 0.5; });
+      });
+      return pos;
+    }
+    function sortBy(row, neighbours, pos) {
+      var key = {};
+      row.forEach(function (id) {
+        var ns = neighbours(id).filter(function (n) { return pos[n] !== undefined; });
+        key[id] = ns.length
+          ? ns.reduce(function (a, n) { return a + pos[n]; }, 0) / ns.length
+          : pos[id];
+      });
+      row.sort(function (a, b) { return key[a] - key[b] || a.localeCompare(b); });
+    }
+
+    for (var pass = 0; pass < 3; pass++) {
+      var pos = posOf(rows);
+      for (var i = 1; i <= maxRank; i++) {
+        sortBy(rows[i], function (id) { return nodes[id].out; }, pos);
+      }
+      pos = posOf(rows);
+      for (var j = maxRank - 1; j >= 0; j--) {
+        sortBy(rows[j], function (id) { return nodes[id].inn; }, pos);
+      }
+    }
+    return rows;
+  }
+
+  function depsGraphSvg(edges) {
+    if (!edges.length) return '';
+
+    var laid = rankNodes(edges);
+    var rows = orderRanks(laid.nodes, laid.rank);
+    var maxRank = rows.length - 1;
+
+    var BW = 170, BH = 44, ROW = 108, GAP = 30;
+    var LANE = 22, RAILS = 4;              // 跨層的線走側邊軌道
+    var SIDE = 30 + RAILS * LANE;          // 左右各留給軌道的寬度
+    var widest = rows.reduce(function (m, r) { return Math.max(m, r.length); }, 1);
+    var W = SIDE * 2 + widest * (BW + GAP) - GAP;
+    var TOP = 14;
+    var H = TOP + (maxRank + 1) * BH + maxRank * (ROW - BH) + 16;
+
+    var xy = {};
+    rows.forEach(function (row, r) {
+      var y = TOP + (maxRank - r) * ROW;
+      var inner = W - SIDE * 2 - BW;
+      row.forEach(function (id, i) {
+        var x = row.length > 1 ? SIDE + inner * i / (row.length - 1) : SIDE + inner / 2;
+        xy[id] = { x: x, y: y, cx: x + BW / 2 };
+      });
+    });
+
+    // 軌道分配：跨越愈多層的走愈外圈，左右交替
+    var multi = edges.filter(function (e) {
+      return xy[e.from] && xy[e.to] && laid.rank[e.from] - laid.rank[e.to] > 1;
+    }).sort(function (a, b) {
+      return (laid.rank[b.from] - laid.rank[b.to]) - (laid.rank[a.from] - laid.rank[a.to]);
+    });
+    var rail = {}, used = [0, 0];
+    multi.forEach(function (e, i) {
+      var side = i % 2;                                  // 0 = 左，1 = 右
+      var slot = used[side]++ % RAILS;
+      rail[e.from + '>' + e.to + '>' + e.ref] = {
+        x: side === 0 ? SIDE - 26 - slot * LANE : W - SIDE + 26 + slot * LANE,
+        // 進出軌道的橫線也要錯開，否則同一排的目標會疊在同一條高度上
+        off: 14 + (i % 5) * 7
+      };
+    });
+
+    var svg = '<svg class="dep-graph" viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="' +
+      esc('相依關係圖：' + Object.keys(xy).length + ' 個 repo、' + edges.length + ' 條相依') + '"><defs>' +
+      ['sync', 'behind', 'diverged', 'unknown'].map(function (k) {
+        return '<marker id="gm-' + k + '" viewBox="0 0 10 10" refX="9.5" refY="5" ' +
+          'markerWidth="8" markerHeight="8" orient="auto-start-reverse">' +
+          '<path class="gm ' + k + '" d="M0.5 1 L9.5 5 L0.5 9 z"/></marker>';
+      }).join('') + '</defs>';
+
+    edges.forEach(function (e) {
+      var a = xy[e.from], b = xy[e.to];
+      if (!a || !b) return;
+      var st = edgeState(e);
+      var pin = pinLabel(e);
+      var tip = esc(shortName(e.from) + ' → ' + shortName(e.to) + '\n' +
+        (e.kind === 'submodule' ? 'submodule ' : 'Cargo ') + e.ref +
+        '\n釘在 ' + pin + '　' + st.label + (st.note ? '\n' + st.note : ''));
+      var y1 = a.y + BH, y2 = b.y;
+      var rl = rail[e.from + '>' + e.to + '>' + e.ref];
+      var d, label;
+
+      if (!rl) {
+        // 相鄰層：直接連過去
+        d = 'M' + a.cx + ' ' + y1 + ' L' + b.cx + ' ' + y2;
+        label = { x: (a.cx + b.cx) / 2, y: (y1 + y2) / 2 + 4, rot: 0 };
+      } else {
+        // 跨層：出來、走軌道、再進去，不穿過中間的節點
+        var e1 = y1 + rl.off, e2 = y2 - rl.off;
+        d = 'M' + a.cx + ' ' + y1 + ' L' + a.cx + ' ' + e1 + ' L' + rl.x + ' ' + e1 +
+            ' L' + rl.x + ' ' + e2 + ' L' + b.cx + ' ' + e2 + ' L' + b.cx + ' ' + y2;
+        label = { x: rl.x, y: (e1 + e2) / 2, rot: -90 };
+      }
+
+      svg += '<path class="g-edge ' + st.cls + '" d="' + d + '" marker-end="url(#gm-' + st.cls +
+             ')"><title>' + tip + '</title></path>';
+
+      if (pin && pin !== '—') {
+        var w = pin.length * 6.1 + 10;
+        var g = label.rot
+          ? ' transform="rotate(-90 ' + label.x + ' ' + label.y + ')"'
+          : '';
+        svg += '<g' + g + '><rect class="g-pin-bg" x="' + (label.x - w / 2) + '" y="' +
+               (label.y - 11) + '" width="' + w + '" height="15" rx="4"/>' +
+               '<text class="g-pin ' + st.cls + '" x="' + label.x + '" y="' + label.y +
+               '" text-anchor="middle">' + esc(pin) + '</text></g>';
+      }
+    });
+
+    Object.keys(xy).forEach(function (id) {
+      var p = xy[id], d = state.data[id] || {};
+      var ver = (d.releases && d.releases[0] && d.releases[0].tag) ||
+                (d.tags && d.tags[0] && d.tags[0].name) || '無版本 tag';
+      svg += '<g class="g-node">' +
+        '<rect class="g-box" x="' + p.x + '" y="' + p.y + '" width="' + BW + '" height="' + BH + '" rx="6"/>' +
+        '<text class="g-name" x="' + (p.x + 11) + '" y="' + (p.y + 19) + '">' + esc(shortName(id)) + '</text>' +
+        '<text class="g-ver" x="' + (p.x + 11) + '" y="' + (p.y + 34) + '">' + esc(ver) + '</text>' +
+        '</g>';
+    });
+
+    return svg + '</svg>';
+  }
+
+  function depsLegend() {
+    return '<div class="g-legend">' + [
+      ['sync', '釘在最新版或完全同步'],
+      ['behind', '可以往前追'],
+      ['diverged', '釘在別條分支，已經分家'],
+      ['unknown', '沒量到']
+    ].map(function (x) {
+      return '<span class="g-key"><i class="' + x[0] + '"></i>' + esc(x[1]) + '</span>';
+    }).join('') + '<span class="g-hint">線上的字是釘住的版本，滑過去看細節</span></div>';
+  }
+
   function renderDeps() {
     var sec = $('#deps');
     if (!CFG.analyseDeps || !state.repos.length) { sec.hidden = true; return; }
@@ -979,6 +1160,7 @@
       $('#deps-status').textContent = '尚未分析 · 會讀各 repo 的 .gitmodules 與 Cargo.toml';
       $('#btn-deps').textContent = '分析';
       $('#btn-deps-toggle').hidden = true;
+      $('.seg-group').hidden = true;
       $('#deps-body').innerHTML = '';
       return;
     }
@@ -994,13 +1176,27 @@
       ' · 這次用了 ' + d.calls + ' 次 API';
     $('#btn-deps').textContent = '重新分析';
     $('#btn-deps-toggle').hidden = false;
+    $('.seg-group').hidden = false;
 
     var rows = d.edges.slice().sort(function (a, b) {
       var rank = function (e) { return { behind: 0, diverged: 1, unknown: 2, sync: 3 }[edgeState(e).cls]; };
       return rank(a) - rank(b) || (b.behind || 0) - (a.behind || 0) || a.from.localeCompare(b.from);
     });
 
-    var html = '<div class="tablewrap"><table class="dep-table"><thead><tr>' +
+    var view = state.depsView || 'graph';
+    var html = '';
+
+    if (view === 'graph') {
+      html += '<div class="graphwrap">' + depsGraphSvg(rows) + '</div>' + depsLegend();
+      if (d.external.length) html += externalHtml(d);
+      if (state.depsRendered !== d.analysedAt + view) {
+        $('#deps-body').innerHTML = html;
+        state.depsRendered = d.analysedAt + view;
+      }
+      return;
+    }
+
+    html += '<div class="tablewrap"><table class="dep-table"><thead><tr>' +
       '<th>依賴方</th><th>被依賴</th><th>怎麼引用</th><th>釘在</th><th>上游最新</th><th>狀態</th>' +
       '</tr></thead><tbody>';
 
@@ -1019,24 +1215,26 @@
     });
     html += '</tbody></table></div>';
 
-    if (d.external.length) {
-      var byRepo = {};
-      d.external.forEach(function (e) { (byRepo[e.to] = byRepo[e.to] || []).push(e); });
-      html += '<details class="ext"><summary>另外還有 ' + Object.keys(byRepo).length +
-        ' 個追蹤清單外的相依（外部專案、不分析）</summary><ul>';
-      Object.keys(byRepo).sort().forEach(function (t) {
-        html += '<li><code>' + esc(t) + '</code> ← ' +
-          byRepo[t].map(function (e) { return esc(shortName(e.from)); }).filter(function (v, i, a) {
-            return a.indexOf(v) === i;
-          }).join('、') + '</li>';
-      });
-      html += '</ul></details>';
-    }
+    if (d.external.length) html += externalHtml(d);
 
-    if (state.depsRendered !== d.analysedAt) {
+    if (state.depsRendered !== d.analysedAt + view) {
       $('#deps-body').innerHTML = html;
-      state.depsRendered = d.analysedAt;
+      state.depsRendered = d.analysedAt + view;
     }
+  }
+
+  function externalHtml(d) {
+    var byRepo = {};
+    d.external.forEach(function (e) { (byRepo[e.to] = byRepo[e.to] || []).push(e); });
+    var html = '<details class="ext"><summary>另外還有 ' + Object.keys(byRepo).length +
+      ' 個追蹤清單外的相依（外部專案、不分析）</summary><ul>';
+    Object.keys(byRepo).sort().forEach(function (t) {
+      html += '<li><code>' + esc(t) + '</code> ← ' +
+        byRepo[t].map(function (e) { return shortName(e.from); }).filter(function (v, i, a) {
+          return a.indexOf(v) === i;
+        }).map(esc).join('、') + '</li>';
+    });
+    return html + '</ul></details>';
   }
 
   // 卡片上的兩行：往下依賴誰、往上被誰依賴
@@ -1228,6 +1426,14 @@
     $('#show-archived').addEventListener('change', fetchMissing);
 
     $('#btn-deps').addEventListener('click', analyseDeps);
+    [['#btn-view-graph', 'graph'], ['#btn-view-table', 'table']].forEach(function (x) {
+      $(x[0]).addEventListener('click', function () {
+        state.depsView = x[1];
+        $('#btn-view-graph').classList.toggle('on', x[1] === 'graph');
+        $('#btn-view-table').classList.toggle('on', x[1] === 'table');
+        render();
+      });
+    });
     $('#btn-deps-toggle').addEventListener('click', function () {
       var b = $('#deps-body');
       b.hidden = !b.hidden;
