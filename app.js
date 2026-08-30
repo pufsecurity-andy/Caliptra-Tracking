@@ -1006,17 +1006,6 @@
     return knownVersions(fullName)[0] || '';
   }
 
-  function nodeVersionsFull(fullName) {
-    var d = state.deps;
-    if (d && d.root && d.nodeRefs && d.nodeRefs[fullName]) {
-      var seen = {};
-      return d.nodeRefs[fullName].map(function (r) {
-        return (d.shaTag && d.shaTag[r]) || shortRef(r);
-      }).filter(function (v) { if (seen[v]) return false; seen[v] = 1; return true; }).join('、');
-    }
-    return repoVersion(fullName) || '沒有 tag';
-  }
-
   // 節點上要顯示的版本：指定起點時顯示「這個版本實際綁到的」，否則顯示上游最新版
   function nodeVersion(fullName) {
     var d = state.deps;
@@ -1079,7 +1068,7 @@
 
   // 分層 + 在中間層補虛擬節點，長線才有辦法從節點之間穿過去，
   // 而不是全部繞到畫布外側把中間塞滿橫線。
-  function layeredLayout(edges) {
+  function layeredLayout(edges, meta) {
     var GAP = 30, DGAP = 14, ROW = 112, BH = 52, PAD = 24, DW = 8, MAXW = 208;
     function gapOf(a, b) {
       return (a.kind === 'dummy' || b.kind === 'dummy') ? DGAP : GAP;
@@ -1093,8 +1082,8 @@
     // 1. 分層：沒有往外相依的排最底層；遇到環就地切斷
     var ids = {}, out = {};
     edges.forEach(function (e) {
-      ids[e.from] = 1; ids[e.to] = 1;
-      (out[e.from] = out[e.from] || []).push(e.to);
+      ids[e.fk] = 1; ids[e.tk] = 1;
+      (out[e.fk] = out[e.fk] || []).push(e.tk);
     });
     var rank = {}, mark = {};
     function visit(id) {
@@ -1114,10 +1103,11 @@
     for (var r = 0; r <= maxRank; r++) layers[r] = [];
     Object.keys(ids).sort().forEach(function (id) {
       // 寬度要同時容得下名稱與版本字串，否則版本會凸出框外
+      var m = meta[id] || { name: id, ver: '' };
       var it = {
         key: id, kind: 'node', id: id, rank: rank[id],
         w: Math.min(MAXW,
-             Math.max(132, shortName(id).length * 7.4 + 30, nodeVersion(id).length * 6.5 + 30)),
+             Math.max(132, m.name.length * 7.4 + 30, m.ver.length * 6.5 + 30)),
         up: [], down: []
       };
       items[id] = it;
@@ -1126,7 +1116,7 @@
 
     var chains = [];
     edges.forEach(function (e, idx) {
-      var a = items[e.from], b = items[e.to];
+      var a = items[e.fk], b = items[e.tk];
       if (!a || !b || a === b) return;
       var chain = [a], prev = a;
       for (var r2 = a.rank - 1; r2 > b.rank; r2--) {
@@ -1249,70 +1239,86 @@
 
   function r1(n) { return Math.round(n * 10) / 10; }
 
-  // 把路徑點轉成直角折線：往下 → 橫移 → 再往下。
-  // jog 是橫移發生的高度，同一個節點出來的多條線各自錯開，橫線才不會疊在一起。
-  function orthogonalize(pts, jog) {
-    var out = [{ x: pts[0].x, y: pts[0].y }];
-    for (var i = 1; i < pts.length; i++) {
-      var a = out[out.length - 1], b = pts[i];
-      if (Math.abs(a.x - b.x) > 1.5) {
-        var mid = (a.y + b.y) / 2 + jog;
-        mid = Math.max(a.y + 10, Math.min(b.y - 10, mid));
-        out.push({ x: a.x, y: mid }, { x: b.x, y: mid });
-      }
-      out.push({ x: b.x, y: b.y });
-    }
-    // 去掉重複與同一直線上的多餘點
-    var clean = [out[0]];
-    for (var j = 1; j < out.length; j++) {
-      var p = out[j], q = clean[clean.length - 1];
-      if (Math.abs(p.x - q.x) < 0.5 && Math.abs(p.y - q.y) < 0.5) continue;
-      if (clean.length >= 2) {
-        var o = clean[clean.length - 2];
-        var sameV = Math.abs(o.x - q.x) < 0.5 && Math.abs(q.x - p.x) < 0.5;
-        var sameH = Math.abs(o.y - q.y) < 0.5 && Math.abs(q.y - p.y) < 0.5;
-        if (sameV || sameH) { clean[clean.length - 1] = p; continue; }
-      }
-      clean.push(p);
-    }
-    return clean;
-  }
-
-  // 折線轉成帶圓角的路徑
-  function roundedPath(pts, r) {
+  // 折線點轉成曲線：同一層裡的垂直段保持直的，跨層的位移用一段
+  // 上下對稱的三次貝茲接起來，看起來就是流程圖那種順順的線。
+  function curvePath(pts) {
     if (pts.length < 2) return '';
     var d = 'M' + r1(pts[0].x) + ' ' + r1(pts[0].y);
-    for (var i = 1; i < pts.length - 1; i++) {
-      var p = pts[i], a = pts[i - 1], b = pts[i + 1];
-      var d1 = Math.hypot(p.x - a.x, p.y - a.y) || 1;
-      var d2 = Math.hypot(b.x - p.x, b.y - p.y) || 1;
-      var rr = Math.min(r, d1 / 2, d2 / 2);
-      d += ' L' + r1(p.x + (a.x - p.x) / d1 * rr) + ' ' + r1(p.y + (a.y - p.y) / d1 * rr) +
-           ' Q' + r1(p.x) + ' ' + r1(p.y) + ' ' +
-           r1(p.x + (b.x - p.x) / d2 * rr) + ' ' + r1(p.y + (b.y - p.y) / d2 * rr);
+    for (var i = 1; i < pts.length; i++) {
+      var a = pts[i - 1], b = pts[i];
+      if (Math.abs(a.x - b.x) < 0.5) { d += ' L' + r1(b.x) + ' ' + r1(b.y); continue; }
+      var k = (b.y - a.y) * 0.5;
+      d += ' C' + r1(a.x) + ' ' + r1(a.y + k) +
+           ' ' + r1(b.x) + ' ' + r1(b.y - k) +
+           ' ' + r1(b.x) + ' ' + r1(b.y);
     }
-    var last = pts[pts.length - 1];
-    return d + ' L' + r1(last.x) + ' ' + r1(last.y);
+    return d;
+  }
+
+  // 圖上的一個 block ＝ 一個 repo 的一個版本。指定起點時，同一個 repo 被釘在兩個版本
+  // 就畫成兩個 block，這樣每條線對到哪一版一目了然，不用擠在同一格寫「a / b」。
+  function graphKeys() {
+    var split = !!(state.deps && state.deps.root);
+    var meta = {};
+    function put(key, repo, ref, ver) {
+      var m = meta[key];
+      if (!m) m = meta[key] = { repo: repo, ref: ref, name: shortName(repo), ver: ver || '' };
+      else if (!m.ver && ver) m.ver = ver;
+      return key;
+    }
+    return {
+      meta: meta,
+      keys: function (e) {
+        if (!split) {
+          return {
+            fk: put(e.from, e.from, '', nodeVersion(e.from)),
+            tk: put(e.to, e.to, '', nodeVersion(e.to))
+          };
+        }
+        var childRef = e.sha || '';
+        return {
+          fk: put(e.from + '@' + e.fromRef, e.from, e.fromRef, refName(e.fromRef)),
+          tk: put(e.to + '@' + (childRef || pinLabel(e)), e.to, childRef,
+                  childRef ? refName(childRef) : pinLabel(e))
+        };
+      }
+    };
+  }
+
+  // 這個 block 是被誰釘成這一版的 —— tooltip 用
+  function pinnedBy(meta) {
+    var d = state.deps;
+    if (!d || !d.nodeVia || !meta.ref) return '';
+    var vias = d.nodeVia[meta.repo + '@' + meta.ref];
+    if (!vias || !vias.length) return '';
+    return vias.map(function (v) {
+      var parts = v.split(VIA_SEP);
+      return shortName(parts[0]) + ' ' + parts[1];
+    }).join('\n');
   }
 
   function depsGraphSvg(edges) {
     if (!edges.length) return '';
-    // 同一對 repo 之間釘同一個版本的重複引用（例如 hw/latest 與 hw/rev-2_1 都指向同一版），
-    // 圖上畫一條就好；釘不同版本的才各畫一條。完整清單在表格那邊。
+    var K = graphKeys();
+    // 兩個 block 之間的重複引用（例如 hw/latest 與 hw/rev-2_1 都指向同一版），
+    // 圖上畫一條就好。完整清單在表格那邊。
     var seen = {}, merged = [];
     edges.forEach(function (e) {
-      var k = e.from + '>' + e.to + '>' + pinLabel(e) + '>' + edgeState(e).cls;
+      var kk = K.keys(e);
+      var k = kk.fk + '>' + kk.tk + '>' + edgeState(e).cls;
       if (seen[k]) { seen[k].dup++; return; }
-      var copy = Object.assign({}, e, { dup: 1 });
+      var copy = Object.assign({}, e, { dup: 1, fk: kk.fk, tk: kk.tk });
       seen[k] = copy;
       merged.push(copy);
     });
-    var G = layeredLayout(merged);
+    var meta = K.meta;
+    var G = layeredLayout(merged, meta);
     if (!G.chains.length) return '';
 
     var svg = '<svg class="dep-graph" viewBox="0 0 ' + Math.round(G.W) + ' ' + Math.round(G.H) +
       '" role="img" aria-label="' +
-      esc('相依關係圖：' + Object.keys(G.items).length + ' 個 repo、' + G.chains.length + ' 條相依') +
+      esc('相依關係圖：' + Object.keys(G.items).length + ' 個版本 block、' +
+          G.chains.length + ' 條相依') +
       '"><defs>' +
       ['sync', 'behind', 'diverged', 'unknown'].map(function (kk) {
         return '<marker id="gm-' + kk + '" viewBox="0 0 10 10" refX="9" refY="5" ' +
@@ -1321,12 +1327,11 @@
       }).join('') + '</defs>';
 
     var edgeSvg = '';
-    G.chains.forEach(function (c, ci) {
+    G.chains.forEach(function (c) {
       var e = c.edge, st = edgeState(e), pin = pinLabel(e);
-      var dupKey = e.to + '@' + pin;
-      var jog = ((ci * 3) % 5 - 2) * 8;   // -16 / -8 / 0 / 8 / 16
-      // 虛擬節點給上下兩個點：橫移只會發生在層與層之間的空隙，
-      // 穿過節點那一排時一定是純垂直線，不會有橫線切過節點框。
+      var dupKey = e.tk;
+      // 虛擬節點給上下兩個點：穿過節點那一排時是純垂直線，
+      // 左右位移只發生在層與層之間的空隙，線才不會切過節點框。
       var pts = [];
       c.chain.forEach(function (it, i) {
         if (i === 0) { pts.push({ x: c.exitX, y: it.y + G.BH }); return; }            // 來源底部
@@ -1334,9 +1339,8 @@
         pts.push({ x: it.cx, y: it.y }, { x: it.cx, y: it.y + G.BH });         // 穿過中間層
       });
 
-      var route = orthogonalize(pts, jog);
-      edgeSvg += '<path class="g-edge ' + st.cls + '" d="' + roundedPath(route, 11) +
-        '" data-from="' + esc(e.from) + '" data-to="' + esc(e.to) + '" data-lk="' + esc(dupKey) +
+      edgeSvg += '<path class="g-edge ' + st.cls + '" d="' + curvePath(pts) +
+        '" data-from="' + esc(e.fk) + '" data-to="' + esc(e.tk) + '" data-lk="' + esc(dupKey) +
         '" marker-end="url(#gm-' + st.cls + ')"><title>' +
         esc(shortName(e.from) + ' → ' + shortName(e.to) + '\n' +
             (e.kind === 'submodule' ? 'submodule ' : 'Cargo ') + e.ref +
@@ -1352,15 +1356,18 @@
     G.layers.forEach(function (L) {
       L.forEach(function (it) {
         if (it.kind !== 'node') return;
-        var ver = nodeVersion(it.id);
-        var full = nodeVersionsFull(it.id);
+        var m = meta[it.id] || { name: it.id, ver: '' };
+        var ver = m.ver || '沒有 tag';
+        var by = pinnedBy(m);
         svg += '<g class="g-node" data-id="' + esc(it.id) + '"><title>' +
-          esc(shortName(it.id) + '\n' + (state.deps && state.deps.root ? '這個版本綁到：' : '最新版本：') + full) +
+          esc(m.name + '\n' +
+              (state.deps && state.deps.root ? '這棵樹綁到：' : '最新版本：') + ver +
+              (by ? '\n被這些地方釘成這一版：\n' + by : '')) +
           '</title>' +
           '<rect class="g-box" x="' + (it.cx - it.w / 2) + '" y="' + it.y +
           '" width="' + it.w + '" height="' + G.BH + '" rx="6"/>' +
           '<text class="g-name" x="' + it.cx + '" y="' + (it.y + 22) + '" text-anchor="middle">' +
-          esc(shortName(it.id)) + '</text>' +
+          esc(m.name) + '</text>' +
           '<text class="g-ver" x="' + it.cx + '" y="' + (it.y + 38) + '" text-anchor="middle">' +
           esc(ver) + '</text></g>';
       });
