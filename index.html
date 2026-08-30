@@ -48,6 +48,7 @@
     <div class="seg-group" role="group" aria-label="檢視方式">
       <button id="btn-view-graph" class="seg on" type="button">關係圖</button>
       <button id="btn-view-table" class="seg" type="button">表格</button>
+      <button id="btn-view-diff" class="seg" type="button" hidden>版本比較</button>
     </div>
     <button id="btn-deps" class="primary">分析</button>
     <button id="btn-deps-toggle" class="ghost" hidden>收合</button>
@@ -60,8 +61,11 @@
     <label class="ctl">版本
       <select id="deps-ref" aria-label="用哪個版本"></select>
     </label>
+    <label class="ctl" id="ctl-ref-b">比較
+      <select id="deps-ref-b" aria-label="跟哪個版本比較"></select>
+    </label>
     <button id="btn-refs-reload" class="ghost" type="button" hidden>載入版本清單</button>
-    <label class="ctl check"><input id="deps-show-sync" type="checkbox"> 一併顯示沒問題的</label>
+    <label class="ctl check" id="ctl-show-sync"><input id="deps-show-sync" type="checkbox"> 一併顯示沒問題的</label>
     <span id="deps-mode-hint" class="ctl-hint"></span>
   </div>
 

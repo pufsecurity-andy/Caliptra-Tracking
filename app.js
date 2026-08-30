@@ -41,6 +41,7 @@
     depsView: 'graph',
     depsRoot: '',
     depsRef: '',
+    depsRefB: '',     // 要跟哪個版本比（空字串＝不比較）
     depsHidden: {},
     depsShowSync: false,
     refCache: {},
@@ -451,6 +452,8 @@
       var v = JSON.parse(lsGet(KEY.depsView) || '{}');
       state.depsRoot = v.root || '';
       state.depsRef = v.ref || '';
+      state.depsRefB = v.refB || '';
+      if (v.view) state.depsView = v.view;
       state.depsHidden = v.hidden || {};
       state.depsShowSync = !!v.showSync;
     } catch (e) { /* 用預設值 */ }
@@ -908,10 +911,21 @@
       }).then(scanNext);
     }
 
-    // 2. 每個出現過的 repo 抓 tag 清單：把 commit 對回版本名，也給版本下拉選單用
+    // 2. 使用者選了要比的版本，就把那個版本的樹也解析一次（只要版本，不比落後量）
+    var compare = null;
+    function compareTreeStep() {
+      var refB = root ? (state.depsRefB || '') : '';
+      if (!refB || refB === rootRef) return Promise.resolve();
+      return resolveTree(root, refB).then(function (refs) {
+        compare = { rootRef: refB, nodeRefs: refs };
+      }, function (err) { banner('比較版本讀取失敗：' + errText(err), 'error'); });
+    }
+
+    // 3. 每個出現過的 repo 抓 tag 清單：把 commit 對回版本名，也給版本下拉選單用
     function tagsStep() {
       var want = {};
       Object.keys(nodeRefs).forEach(function (r) { want[r] = 1; });
+      if (compare) Object.keys(compare.nodeRefs).forEach(function (r) { want[r] = 1; });
       edges.forEach(function (e) { want[e.to] = 1; want[e.from] = 1; });
       return series(Object.keys(want), function (t) {
         if (!trackedRepo(t)) return Promise.resolve();
@@ -926,7 +940,7 @@
       });
     }
 
-    // 3. 每條邊離上游多遠
+    // 4. 每條邊離上游多遠
     function compareStep() {
       var todo = edges.filter(function (e) { return !!e.sha && trackedRepo(e.to); });
       var n = 0;
@@ -945,7 +959,7 @@
       });
     }
 
-    return scanNext().then(tagsStep).then(compareStep).then(function () {
+    return scanNext().then(compareTreeStep).then(tagsStep).then(compareStep).then(function () {
       edges.forEach(function (e) {
         var d = state.data[e.to];
         if (!d) return;
@@ -956,7 +970,7 @@
       state.deps = {
         analysedAt: new Date().toISOString(), root: root, rootRef: rootRef,
         edges: edges, external: external, repoTags: repoTags, shaTag: shaTag,
-        nodeRefs: nodeRefs, calls: state.calls
+        nodeRefs: nodeRefs, compare: compare, calls: state.calls
       };
       lsSet(KEY.deps, JSON.stringify(state.deps));
       banner('分析完成，用了 ' + state.calls + ' 次 API。', 'info');
@@ -1446,46 +1460,60 @@
     rootSel.value = state.depsRoot || '';
 
     var g = state.depsRoot ? depsRefGroups(state.depsRoot) : null;
-    var rsig = state.depsRoot + '|' + (state.refLoading === state.depsRoot ? 'loading' : '') + '|' +
-      (g ? g.dflt + '#' + g.tags.length + '#' + g.branches.length + '#' + (state.depsRef || '') : '');
-    if (refSel.dataset.sig !== rsig) {
-      refSel.dataset.sig = rsig;
-      if (!g) {
-        refSel.innerHTML = '<option value="">—</option>';
-      } else {
-        var opt = function (v, label) {
-          return '<option value="' + esc(v) + '">' + esc(label || v) + '</option>';
-        };
-        var html = opt(g.dflt, g.dflt + '（預設分支）');
-        if (state.depsRef && state.depsRef !== g.dflt &&
-            g.tags.indexOf(state.depsRef) === -1 && g.branches.indexOf(state.depsRef) === -1) {
-          html += opt(state.depsRef);
-        }
-        if (g.tags.length) {
-          html += '<optgroup label="tag（' + g.tags.length + '）">' +
-            g.tags.map(function (t) { return opt(t); }).join('') + '</optgroup>';
-        }
-        if (g.branches.length) {
-          html += '<optgroup label="分支（' + g.branches.length + '）">' +
-            g.branches.map(function (b) { return opt(b); }).join('') + '</optgroup>';
-        }
-        if (!g.ok && !g.tags.length && state.refLoading !== state.depsRoot) {
-          html += opt('', '（版本清單還沒載入）');
-        }
-        refSel.innerHTML = html;
+    var loading = state.refLoading === state.depsRoot;
+
+    // 兩個下拉選單的選項一模一樣，只差在「比較」那個多一個「不比較」
+    function fillRefs(sel, current, blank) {
+      var sig = state.depsRoot + '|' + (loading ? 'loading' : '') + '|' + (blank || '') + '|' +
+        (g ? g.dflt + '#' + g.tags.length + '#' + g.branches.length + '#' + (current || '') : '');
+      if (sel.dataset.sig === sig) return;
+      sel.dataset.sig = sig;
+      if (!g) { sel.innerHTML = '<option value="">—</option>'; return; }
+
+      var opt = function (v, label) {
+        return '<option value="' + esc(v) + '">' + esc(label || v) + '</option>';
+      };
+      var html = blank ? opt('', blank) : '';
+      html += opt(g.dflt, g.dflt + '（預設分支）');
+      if (current && current !== g.dflt &&
+          g.tags.indexOf(current) === -1 && g.branches.indexOf(current) === -1) {
+        html += opt(current);
       }
+      if (g.tags.length) {
+        html += '<optgroup label="tag（' + g.tags.length + '）">' +
+          g.tags.map(function (t) { return opt(t); }).join('') + '</optgroup>';
+      }
+      if (g.branches.length) {
+        html += '<optgroup label="分支（' + g.branches.length + '）">' +
+          g.branches.map(function (b) { return opt(b); }).join('') + '</optgroup>';
+      }
+      if (!blank && !g.ok && !g.tags.length && !loading) {
+        html += opt('', '（版本清單還沒載入）');
+      }
+      sel.innerHTML = html;
     }
-    refSel.disabled = !state.depsRoot || state.refLoading === state.depsRoot;
+
+    fillRefs(refSel, state.depsRef, '');
+    refSel.disabled = !state.depsRoot || loading;
     if (state.depsRoot && !state.depsRef) state.depsRef = g ? g.dflt : '';
     refSel.value = state.depsRef || '';
 
+    var refBSel = $('#deps-ref-b');
+    $('#ctl-ref-b').hidden = !state.depsRoot;
+    if (!state.depsRoot) state.depsRefB = '';
+    fillRefs(refBSel, state.depsRefB, '（不比較）');
+    refBSel.disabled = !state.depsRoot || loading;
+    refBSel.value = state.depsRefB || '';
+
     var d = state.deps;
     var changed = d && (d.root !== (state.depsRoot || '') ||
-                        (state.depsRoot && d.rootRef !== state.depsRef));
+                        (state.depsRoot && (d.rootRef !== state.depsRef ||
+                          ((d.compare && d.compare.rootRef) || '') !== (state.depsRefB || ''))));
     var err = g && g.error;
     $('#deps-mode-hint').textContent =
       state.refLoading === state.depsRoot && state.depsRoot ? '讀取版本清單…'
       : err ? '版本清單讀不到：' + err
+      : state.depsRefB && state.depsRefB === state.depsRef ? '比較的兩個版本一樣，換一個再比'
       : changed ? '選擇已變更，按「重新分析」套用'
       : state.depsRoot ? '展開這個版本實際綁住的整棵樹'
       : '每個 repo 各自看 main 上宣告了什麼';
@@ -1526,8 +1554,8 @@
 
   function saveDepsView() {
     lsSet(KEY.depsView, JSON.stringify({
-      root: state.depsRoot, ref: state.depsRef,
-      hidden: state.depsHidden, showSync: state.depsShowSync
+      root: state.depsRoot, ref: state.depsRef, refB: state.depsRefB,
+      view: state.depsView, hidden: state.depsHidden, showSync: state.depsShowSync
     }));
   }
 
@@ -1564,6 +1592,112 @@
     }).length;
   }
 
+  /* ---------- 兩個版本的比較 ---------- */
+
+  // 只要每個 repo 解析出來的版本，不需要邊與落後量，所以比完整分析便宜很多
+  function resolveTree(root, ref) {
+    var scanned = {}, queue = [{ repo: root, ref: ref }], nodeRefs = {}, MAX = 26;
+
+    function step() {
+      if (!queue.length) return Promise.resolve(nodeRefs);
+      var job = queue.shift();
+      var key = job.repo + '@' + job.ref;
+      if (scanned[key]) return step();
+      if (Object.keys(scanned).length >= MAX) { queue.length = 0; return Promise.resolve(nodeRefs); }
+      scanned[key] = 1;
+
+      nodeRefs[job.repo] = nodeRefs[job.repo] || [];
+      if (nodeRefs[job.repo].indexOf(job.ref) === -1) nodeRefs[job.repo].push(job.ref);
+      banner('讀取比較版本：' + shortName(job.repo) + ' @ ' + shortRef(job.ref), 'info');
+
+      return Promise.all([
+        raw(job.repo, job.ref, '.gitmodules'),
+        raw(job.repo, job.ref, 'Cargo.toml')
+      ]).then(function (out) {
+        var subs = parseGitmodules(out[0]);
+        parseCargoGit(out[1]).forEach(function (d) {
+          if (trackedRepo(d.repo) && d.sha) queue.push({ repo: d.repo, ref: d.sha });
+        });
+        return series(subs, function (sm) {
+          var target = repoFromUrl(sm.url);
+          if (!target || !trackedRepo(target)) return Promise.resolve();
+          return gh('/repos/' + job.repo + '/contents/' + sm.path, { ref: job.ref })
+            .then(function (c) {
+              if (c && !Array.isArray(c) && c.sha) queue.push({ repo: target, ref: c.sha });
+            }, function () { /* 拿不到就算了 */ });
+        });
+      }).then(step);
+    }
+    return step();
+  }
+
+  function refName(r) {
+    var d = state.deps;
+    return (d && d.shaTag && d.shaTag[r]) || shortRef(r);
+  }
+
+  // 同一個 repo 可能被好幾個上層釘在不同版本，所以是一組版本而不是一個。
+  // 排序過再接起來，兩邊才不會因為順序不同就被誤判成有變動。
+  function refsText(list) {
+    if (!list || !list.length) return '—';
+    var seen = {}, out = [];
+    list.map(refName).forEach(function (v) {
+      if (!seen[v]) { seen[v] = 1; out.push(v); }
+    });
+    return out.sort().join('、');
+  }
+
+  function renderDiff(d) {
+    var cmp = d.compare;
+    if (!cmp) {
+      return '<p class="deps-empty">上面的「比較」選一個版本，再按「重新分析」，' +
+        '這裡就會一列一個 repo，列出兩個版本各自綁到哪一版。</p>';
+    }
+    var repos = {};
+    Object.keys(d.nodeRefs || {}).forEach(function (k) { repos[k] = 1; });
+    Object.keys(cmp.nodeRefs || {}).forEach(function (k) { repos[k] = 1; });
+
+    var rows = Object.keys(repos).filter(function (k) {
+      return !state.depsHidden[k];
+    }).map(function (k) {
+      var a = refsText((d.nodeRefs || {})[k]), b = refsText((cmp.nodeRefs || {})[k]);
+      return { repo: k, a: a, b: b, root: k === d.root, changed: a !== b };
+    });
+    // 起點自己放第一列當標題列，後面有動的排前面
+    rows.sort(function (x, y) {
+      return (y.root - x.root) || (y.changed - x.changed) || x.repo.localeCompare(y.repo);
+    });
+
+    var body = rows.filter(function (r) { return !r.root; });
+    var moved = body.filter(function (r) { return r.changed; }).length;
+    var same = body.length - moved;
+
+    var html = '<p class="diff-lead">' +
+      esc(shortName(d.root)) + ' 從 <b>' + esc(refName(cmp.rootRef)) + '</b> 換到 <b>' +
+      esc(refName(d.rootRef)) + '</b>：' +
+      (moved ? '底下 <b>' + moved + ' 個 repo 跟著換了版本</b>，另外 ' + same + ' 個沒動'
+             : '底下 ' + same + ' 個 repo 綁的版本完全一樣') + '</p>';
+
+    html += '<div class="tablewrap"><table class="dep-table diff-table"><thead><tr>' +
+      '<th>Repo</th><th>' + esc(refName(cmp.rootRef)) + '</th><th></th><th>' +
+      esc(refName(d.rootRef)) + '</th><th>狀態</th></tr></thead><tbody>';
+    rows.forEach(function (r) {
+      var pill = r.root ? '<span class="dep-pill unknown">起點</span>'
+        : r.changed ? '<span class="dep-pill behind">換了版本</span>'
+        : '<span class="dep-pill sync">沒動</span>';
+      html += '<tr class="' + (r.root ? 'rootrow' : r.changed ? 'moved' : 'same') + '">' +
+        '<td class="m">' + esc(shortName(r.repo)) + '</td>' +
+        '<td class="m old">' + esc(r.b) + '</td>' +
+        '<td class="arrow">' + (r.changed ? '→' : '') + '</td>' +
+        '<td class="m new">' + esc(r.a) + '</td>' +
+        '<td>' + pill + '</td>' +
+      '</tr>';
+    });
+    html += '</tbody></table></div>';
+    html += '<p class="diff-foot">一格裡有兩個以上的版本，代表這個 repo 同時被不同的上層釘在不同 commit。</p>';
+    return html;
+  }
+
   function renderDeps() {
     var sec = $('#deps');
     if (!CFG.analyseDeps || !state.repos.length) { sec.hidden = true; return; }
@@ -1584,6 +1718,15 @@
     }
     renderDepsFilter(d);
 
+    var view = state.depsView || 'graph';
+    $('#btn-view-diff').hidden = !d.compare;
+    if (view === 'diff' && !d.compare) view = 'graph';
+    ['graph', 'table', 'diff'].forEach(function (v) {
+      $('#btn-view-' + v).classList.toggle('on', v === view);
+    });
+    // 「一併顯示沒問題的」只影響圖與表格，比較那頁本來就是全部列出來
+    $('#ctl-show-sync').hidden = view === 'diff';
+
     var shown = visibleDepEdges(d);
     var drift = shown.filter(function (e) { return edgeState(e).cls === 'behind'; }).length;
     var forked = shown.filter(function (e) { return edgeState(e).cls === 'diverged'; }).length;
@@ -1603,11 +1746,15 @@
       head = '沒有需要注意的相依';
     }
 
-    $('#deps-status').textContent =
-      (d.root ? shortName(d.root) + ' @ ' + (d.shaTag && d.shaTag[d.rootRef] || shortRef(d.rootRef)) + ' · ' : '') +
-      '分析於 ' + relTime(d.analysedAt) + ' · ' + head +
-      (quiet ? ' · 收起 ' + quiet + ' 條沒問題的' + (hiddenNodeCount(d) ? '（' + hiddenNodeCount(d) + ' 個 repo 因此未顯示）' : '') : '') +
-      ' · 這次用了 ' + d.calls + ' 次 API';
+    var rootLabel = d.root
+      ? shortName(d.root) + ' @ ' + (d.shaTag && d.shaTag[d.rootRef] || shortRef(d.rootRef)) : '';
+    $('#deps-status').textContent = view === 'diff'
+      ? rootLabel + ' ↔ ' + refName(d.compare.rootRef) +
+        ' · 分析於 ' + relTime(d.analysedAt) + ' · 這次用了 ' + d.calls + ' 次 API'
+      : (rootLabel ? rootLabel + ' · ' : '') +
+        '分析於 ' + relTime(d.analysedAt) + ' · ' + head +
+        (quiet ? ' · 收起 ' + quiet + ' 條沒問題的' + (hiddenNodeCount(d) ? '（' + hiddenNodeCount(d) + ' 個 repo 因此未顯示）' : '') : '') +
+        ' · 這次用了 ' + d.calls + ' 次 API';
     $('#btn-deps').textContent = '重新分析';
     $('#btn-deps-toggle').hidden = false;
     $('.seg-group').hidden = false;
@@ -1617,10 +1764,18 @@
       return rank(a) - rank(b) || (b.behind || 0) - (a.behind || 0) || a.from.localeCompare(b.from);
     });
 
-    var view = state.depsView || 'graph';
     var sig = d.analysedAt + '|' + view + '|' + (state.depsShowSync ? 'all' : 'attn') +
               '|' + Object.keys(state.depsHidden).sort().join(',');
     var html = '';
+
+    if (view === 'diff') {
+      html = renderDiff(d);
+      if (state.depsRendered !== sig) {
+        $('#deps-body').innerHTML = html;
+        state.depsRendered = sig;
+      }
+      return;
+    }
 
     if (view === 'graph') {
       html += rows.length
@@ -1901,12 +2056,18 @@
     $('#deps-root').addEventListener('change', function () {
       state.depsRoot = this.value;
       state.depsRef = '';
+      state.depsRefB = '';
       saveDepsView();
       renderDepsControls();
       loadRefsFor(state.depsRoot);
     });
     $('#deps-ref').addEventListener('change', function () {
       state.depsRef = this.value;
+      saveDepsView();
+      renderDepsControls();
+    });
+    $('#deps-ref-b').addEventListener('change', function () {
+      state.depsRefB = this.value;
       saveDepsView();
       renderDepsControls();
     });
@@ -1934,11 +2095,10 @@
       $('#deps-filter').dataset.sig = '';
       render();
     });
-    [['#btn-view-graph', 'graph'], ['#btn-view-table', 'table']].forEach(function (x) {
-      $(x[0]).addEventListener('click', function () {
-        state.depsView = x[1];
-        $('#btn-view-graph').classList.toggle('on', x[1] === 'graph');
-        $('#btn-view-table').classList.toggle('on', x[1] === 'table');
+    ['graph', 'table', 'diff'].forEach(function (v) {
+      $('#btn-view-' + v).addEventListener('click', function () {
+        state.depsView = v;
+        saveDepsView();
         render();
       });
     });
