@@ -780,7 +780,9 @@
   }
 
   function shortRef(ref) {
-    return /^[0-9a-f]{40}$/i.test(ref || '') ? ref.slice(0, 7) : (ref || '');
+    var r = String(ref || '');
+    // 長度不一定剛好 40，只要是一串 hex 就當成 commit 縮寫
+    return /^[0-9a-f]{12,}$/i.test(r) ? r.slice(0, 7) : r;
   }
 
   // https://github.com/owner/name(.git) → owner/name
@@ -1304,7 +1306,7 @@
           '<path class="gm ' + kk + '" d="M1 1.5 L9 5 L1 8.5 z"/></marker>';
       }).join('') + '</defs>';
 
-    var edgeSvg = '', labels = [], labelled = {};
+    var edgeSvg = '';
     G.chains.forEach(function (c, ci) {
       var e = c.edge, st = edgeState(e), pin = pinLabel(e);
       var dupKey = e.to + '@' + pin;
@@ -1329,90 +1331,9 @@
         '</title></path>';
 
       // 只標需要注意的那些，全部都標會糊成一片
-      // 同一個目標釘同一版就只標一次，重複的標籤只是噪音
-      if (st.cls !== 'sync' && pin && pin !== '—' && !labelled[dupKey]) {
-        labelled[dupKey] = 1;
-        // 貼在最長的垂直段上：標籤永遠在線上，不會飄到旁邊
-        var verticals = [];
-        for (var si = 1; si < route.length; si++) {
-          var a = route[si - 1], b = route[si];
-          if (Math.abs(a.x - b.x) < 0.6) {
-            verticals.push({ x: a.x, lo: Math.min(a.y, b.y), hi: Math.max(a.y, b.y),
-                             len: Math.abs(b.y - a.y) });
-          }
-        }
-        verticals.sort(function (p, q) { return q.len - p.len; });
-        var best = verticals[0] || null;
-        if (best && best.len > 26) {
-          labels.push({
-            x: best.x, y: (best.lo + best.hi) / 2, lo: best.lo + 12, hi: best.hi - 12,
-            runs: verticals, w: pin.length * 6.0 + 16, text: pin, cls: st.cls, lk: dupKey
-          });
-        }
-      }
     });
 
-    // 標籤避讓：不只要閃開其他標籤，也不能壓在節點框上
-    var boxes = [];
-    G.layers.forEach(function (L) {
-      L.forEach(function (it) {
-        if (it.kind === 'node') {
-          boxes.push({ x: it.cx, y: it.y + G.BH / 2, w: it.w, h: G.BH });
-        }
-      });
-    });
-    function clash(L, upto) {
-      var j;
-      for (j = 0; j < upto; j++) {
-        var o = labels[j];
-        if (Math.abs(L.x - o.x) < (L.w + o.w) / 2 + 6 && Math.abs(L.y - o.y) < 20) return true;
-      }
-      for (j = 0; j < boxes.length; j++) {
-        var b = boxes[j];
-        if (Math.abs(L.x - b.x) < (L.w + b.w) / 2 + 4 &&
-            Math.abs(L.y - b.y) < (18 + b.h) / 2 + 4) return true;
-      }
-      return false;
-    }
-    labels.forEach(function (L, i) {
-      if (!clash(L, i)) return;
-      var baseY = L.y, baseX = L.x, step, d, k, cands;
-
-      // 依序試遍這條線的每一段垂直線，上下滑動找空位
-      for (var ri = 0; ri < L.runs.length; ri++) {
-        var run = L.runs[ri];
-        if (run.len < 26) continue;
-        L.x = run.x;
-        var mid = (run.lo + run.hi) / 2, lo = run.lo + 12, hi = run.hi - 12;
-        for (step = 0; step <= 12; step++) {
-          d = step * 11;
-          cands = (step ? [mid - d, mid + d] : [mid]).filter(function (y) { return y >= lo && y <= hi; });
-          for (k = 0; k < cands.length; k++) {
-            L.y = cands[k];
-            if (!clash(L, i)) return;
-          }
-        }
-      }
-      L.x = baseX;
-      // 還是擺不下就靠到線的側邊，貼著線仍然讀得出是哪一條
-      var side = L.w / 2 + 12;
-      for (step = 0; step <= 8; step++) {
-        d = step * 13;
-        for (k = 0; k < 4; k++) {
-          L.x = baseX + (k % 2 ? side : -side);
-          L.y = Math.max(L.lo, Math.min(L.hi, baseY + (k < 2 ? -d : d)));
-          if (!clash(L, i)) return;
-        }
-      }
-      L.x = baseX; L.y = baseY;
-    });
-
-    svg += edgeSvg + labels.map(function (L) {
-      return '<g class="g-pin-g" data-lk="' + esc(L.lk) + '"><rect class="g-pin-bg ' + L.cls + '" x="' + r1(L.x - L.w / 2) +
-        '" y="' + r1(L.y - 9) + '" width="' + r1(L.w) + '" height="18" rx="9"/>' +
-        '<text class="g-pin" x="' + r1(L.x) + '" y="' + r1(L.y + 3.5) +
-        '" text-anchor="middle">' + esc(L.text) + '</text></g>';
-    }).join('');
+    svg += edgeSvg;
 
     G.layers.forEach(function (L) {
       L.forEach(function (it) {
@@ -1443,7 +1364,7 @@
     ].map(function (x) {
       var off = x[0] === 'sync' && !state.depsShowSync ? ' muted' : '';
       return '<span class="g-key' + off + '"><i class="' + x[0] + '"></i>' + esc(x[1]) + '</span>';
-    }).join('') + '<span class="g-hint">滑到任一節點只亮它相關的線；綠線沒問題所以不標字</span></div>';
+    }).join('') + '<span class="g-hint">滑到節點只亮它相關的線；滑到線可看釘住的版本</span></div>';
   }
 
   /* ---------- 起點 / 版本 / 顯示哪些 repo ---------- */
