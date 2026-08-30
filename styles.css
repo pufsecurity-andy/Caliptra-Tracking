@@ -617,3 +617,11 @@ body.no-scroll { overflow: hidden; }
   border: none; background: none; color: var(--accent); cursor: pointer;
 }
 .f-all:hover { text-decoration: underline; }
+
+.deps-empty {
+  margin: 14px 0 0; padding: 22px 18px; text-align: center;
+  background: var(--plane); border: 1px dashed var(--border); border-radius: 10px;
+  color: var(--ink-2); font-size: 13px;
+}
+.g-key.muted { opacity: .45; }
+.g-key.muted i { opacity: .35; }

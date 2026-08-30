@@ -42,6 +42,7 @@
     depsRoot: '',
     depsRef: '',
     depsHidden: {},
+    depsShowSync: false,
     refCache: {},
     refError: {},
     refLoading: '',
@@ -451,6 +452,7 @@
       state.depsRoot = v.root || '';
       state.depsRef = v.ref || '';
       state.depsHidden = v.hidden || {};
+      state.depsShowSync = !!v.showSync;
     } catch (e) { /* 用預設值 */ }
     try { state.refCache = JSON.parse(lsGet(KEY.refs) || '{}'); } catch (e) { state.refCache = {}; }
     // 之前版本可能存進失敗的空清單，開檔時先清掉
@@ -1434,12 +1436,13 @@
 
   function depsLegend() {
     return '<div class="g-legend">' + [
-      ['sync', '釘在最新版或完全同步'],
+      ['sync', state.depsShowSync ? '釘在最新版或完全同步' : '釘在最新版或完全同步（已收起）'],
       ['behind', '可以往前追'],
       ['diverged', '釘在別條分支，已經分家'],
       ['unknown', '沒量到']
     ].map(function (x) {
-      return '<span class="g-key"><i class="' + x[0] + '"></i>' + esc(x[1]) + '</span>';
+      var off = x[0] === 'sync' && !state.depsShowSync ? ' muted' : '';
+      return '<span class="g-key' + off + '"><i class="' + x[0] + '"></i>' + esc(x[1]) + '</span>';
     }).join('') + '<span class="g-hint">滑到任一節點只亮它相關的線；綠線沒問題所以不標字</span></div>';
   }
 
@@ -1600,10 +1603,44 @@
         : '<button class="f-all" type="button" data-hide-all="hide">全部隱藏</button>');
   }
 
+  function saveDepsView() {
+    lsSet(KEY.depsView, JSON.stringify({
+      root: state.depsRoot, ref: state.depsRef,
+      hidden: state.depsHidden, showSync: state.depsShowSync
+    }));
+  }
+
   function visibleDepEdges(d) {
     return d.edges.filter(function (e) {
-      return !state.depsHidden[e.from] && !state.depsHidden[e.to];
+      if (state.depsHidden[e.from] || state.depsHidden[e.to]) return false;
+      // 沒問題的相依平常不用看，預設收起來
+      if (!state.depsShowSync && edgeState(e).cls === 'sync') return false;
+      return true;
     });
+  }
+
+  // 收起沒問題的相依之後，有幾個 repo 就整個不會出現在圖上
+  function hiddenNodeCount(d) {
+    if (state.depsShowSync) return 0;
+    function nodesOf(list) {
+      var set = {};
+      list.forEach(function (e) { set[e.from] = 1; set[e.to] = 1; });
+      return set;
+    }
+    var all = nodesOf(d.edges.filter(function (e) {
+      return !state.depsHidden[e.from] && !state.depsHidden[e.to];
+    }));
+    var now = nodesOf(visibleDepEdges(d));
+    return Object.keys(all).filter(function (k) { return !now[k]; }).length;
+  }
+
+  // 被「只看需要注意的」濾掉幾條
+  function syncHiddenCount(d) {
+    if (state.depsShowSync) return 0;
+    return d.edges.filter(function (e) {
+      if (state.depsHidden[e.from] || state.depsHidden[e.to]) return false;
+      return edgeState(e).cls === 'sync';
+    }).length;
   }
 
   function renderDeps() {
@@ -1611,6 +1648,7 @@
     if (!CFG.analyseDeps || !state.repos.length) { sec.hidden = true; return; }
     sec.hidden = false;
 
+    $('#deps-show-sync').checked = state.depsShowSync;
     renderDepsControls();
 
     var d = state.deps;
@@ -1628,14 +1666,26 @@
     var shown = visibleDepEdges(d);
     var drift = shown.filter(function (e) { return edgeState(e).cls === 'behind'; }).length;
     var forked = shown.filter(function (e) { return edgeState(e).cls === 'diverged'; }).length;
+    var quiet = syncHiddenCount(d);
+    var parts = [];
+    if (drift) parts.push(drift + ' 條可以升版');
+    if (forked) parts.push(forked + ' 條釘在別的分支');
+
+    var head;
+    if (state.depsShowSync) {
+      var ok = shown.length - drift - forked;
+      if (ok) parts.push(ok + ' 條沒問題');
+      head = shown.length + ' 條相依' + (parts.length ? '（' + parts.join('、') + '）' : '');
+    } else if (shown.length) {
+      head = '需要注意 ' + shown.length + ' 條' + (parts.length ? '（' + parts.join('、') + '）' : '');
+    } else {
+      head = '沒有需要注意的相依';
+    }
+
     $('#deps-status').textContent =
       (d.root ? shortName(d.root) + ' @ ' + (d.shaTag && d.shaTag[d.rootRef] || shortRef(d.rootRef)) + ' · ' : '') +
-      '分析於 ' + relTime(d.analysedAt) + ' · ' + shown.length +
-      ' 條內部相依' +
-      (drift || forked
-        ? '，其中 ' + (drift ? drift + ' 條可以升版' : '') + (drift && forked ? '、' : '') +
-          (forked ? forked + ' 條釘在別的分支' : '')
-        : '，全部同步') +
+      '分析於 ' + relTime(d.analysedAt) + ' · ' + head +
+      (quiet ? ' · 收起 ' + quiet + ' 條沒問題的' + (hiddenNodeCount(d) ? '（' + hiddenNodeCount(d) + ' 個 repo 因此未顯示）' : '') : '') +
       ' · 這次用了 ' + d.calls + ' 次 API';
     $('#btn-deps').textContent = '重新分析';
     $('#btn-deps-toggle').hidden = false;
@@ -1647,11 +1697,15 @@
     });
 
     var view = state.depsView || 'graph';
-    var sig = d.analysedAt + '|' + view + '|' + Object.keys(state.depsHidden).sort().join(',');
+    var sig = d.analysedAt + '|' + view + '|' + (state.depsShowSync ? 'all' : 'attn') +
+              '|' + Object.keys(state.depsHidden).sort().join(',');
     var html = '';
 
     if (view === 'graph') {
-      html += '<div class="graphwrap">' + depsGraphSvg(rows) + '</div>' + depsLegend();
+      html += rows.length
+        ? '<div class="graphwrap">' + depsGraphSvg(rows) + '</div>' + depsLegend()
+        : '<p class="deps-empty">沒有需要注意的相依 —— 目前釘住的版本都是最新的或完全同步。' +
+          '勾選上面的「一併顯示沒問題的」可以看到完整關係。</p>';
       if (d.external.length) html += externalHtml(d);
       if (state.depsRendered !== sig) {
         $('#deps-body').innerHTML = html;
@@ -1926,14 +1980,20 @@
     $('#deps-root').addEventListener('change', function () {
       state.depsRoot = this.value;
       state.depsRef = '';
-      lsSet(KEY.depsView, JSON.stringify({ root: state.depsRoot, ref: state.depsRef, hidden: state.depsHidden }));
+      saveDepsView();
       renderDepsControls();
       loadRefsFor(state.depsRoot);
     });
     $('#deps-ref').addEventListener('change', function () {
       state.depsRef = this.value;
-      lsSet(KEY.depsView, JSON.stringify({ root: state.depsRoot, ref: state.depsRef, hidden: state.depsHidden }));
+      saveDepsView();
       renderDepsControls();
+    });
+    $('#deps-show-sync').addEventListener('change', function () {
+      state.depsShowSync = this.checked;
+      saveDepsView();
+      state.depsRendered = null;
+      render();
     });
     $('#deps-filter').addEventListener('click', function (e) {
       var chip = e.target.closest('[data-hide]');
@@ -1949,7 +2009,7 @@
           depsNodes(state.deps).forEach(function (n) { state.depsHidden[n] = 1; });
         }
       }
-      lsSet(KEY.depsView, JSON.stringify({ root: state.depsRoot, ref: state.depsRef, hidden: state.depsHidden }));
+      saveDepsView();
       $('#deps-filter').dataset.sig = '';
       render();
     });
