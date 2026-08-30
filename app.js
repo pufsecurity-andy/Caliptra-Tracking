@@ -844,7 +844,7 @@
 
     var root = state.depsRoot && trackedRepo(state.depsRoot) ? state.depsRoot : '';
     var rootRef = root ? (state.depsRef || trackedRepo(root).default_branch) : '';
-    var edges = [], external = [], repoTags = {}, shaTag = {}, nodeRefs = {};
+    var edges = [], external = [], repoTags = {}, shaTag = {}, nodeRefs = {}, nodeVia = {};
     var scanned = {}, queue = [], MAX = 26;
 
     if (root) {
@@ -868,12 +868,12 @@
       if (!queue.length) return Promise.resolve();
       var job = queue.shift();
       var key = job.repo + '@' + job.ref;
+      if (!scanned[key] && Object.keys(scanned).length >= MAX) {
+        queue.length = 0; return Promise.resolve();
+      }
+      noteRef(nodeRefs, nodeVia, job);
       if (scanned[key]) return scanNext();
-      if (Object.keys(scanned).length >= MAX) { queue.length = 0; return Promise.resolve(); }
       scanned[key] = 1;
-
-      nodeRefs[job.repo] = nodeRefs[job.repo] || [];
-      if (nodeRefs[job.repo].indexOf(job.ref) === -1) nodeRefs[job.repo].push(job.ref);
 
       banner('讀取 ' + shortName(job.repo) + ' @ ' + shortRef(job.ref) + ' 的相依宣告…', 'info');
       setBusy(true, '分析中 ' + Object.keys(scanned).length);
@@ -895,7 +895,7 @@
             .then(function (c) {
               if (c && !Array.isArray(c) && c.sha) {
                 e.sha = c.sha;
-                if (root) queue.push({ repo: target, ref: c.sha });
+                if (root) queue.push({ repo: target, ref: c.sha, via: pinSite(job.repo, sm.path) });
               } else { e.error = '取不到釘住的 commit'; }
             }, function (err) { e.error = errText(err); });
         }).then(function () {
@@ -905,7 +905,7 @@
             e.declaredBranch = d.branch; e.sha = d.sha; e.tag = d.tag;
             if (!trackedRepo(d.repo)) { external.push(e); return; }
             edges.push(e);
-            if (root && d.sha) queue.push({ repo: d.repo, ref: d.sha });
+            if (root && d.sha) queue.push({ repo: d.repo, ref: d.sha, via: pinSite(job.repo, d.crate) });
           });
         });
       }).then(scanNext);
@@ -916,8 +916,8 @@
     function compareTreeStep() {
       var refB = root ? (state.depsRefB || '') : '';
       if (!refB || refB === rootRef) return Promise.resolve();
-      return resolveTree(root, refB).then(function (refs) {
-        compare = { rootRef: refB, nodeRefs: refs };
+      return resolveTree(root, refB).then(function (t) {
+        compare = { rootRef: refB, nodeRefs: t.nodeRefs, nodeVia: t.nodeVia };
       }, function (err) { banner('比較版本讀取失敗：' + errText(err), 'error'); });
     }
 
@@ -970,7 +970,7 @@
       state.deps = {
         analysedAt: new Date().toISOString(), root: root, rootRef: rootRef,
         edges: edges, external: external, repoTags: repoTags, shaTag: shaTag,
-        nodeRefs: nodeRefs, compare: compare, calls: state.calls
+        nodeRefs: nodeRefs, nodeVia: nodeVia, compare: compare, calls: state.calls
       };
       lsSet(KEY.deps, JSON.stringify(state.deps));
       banner('分析完成，用了 ' + state.calls + ' 次 API。', 'info');
@@ -1594,20 +1594,39 @@
 
   /* ---------- 兩個版本的比較 ---------- */
 
+  // 「釘住點」＝ 某個上層的某個位置（submodule 路徑或 crate 名）指向某個 repo。
+  // 一個 repo 常常有好幾個釘住點（caliptra-ss 就同時被 mcu-sw 跟 caliptra-sw 的兩條 hw 路徑釘住），
+  // 那正是同一個 repo 會出現兩個以上版本的原因。
+  var VIA_SEP = '\u0001';   // 組 key 用的分隔字元，不會出現在 repo 名或路徑裡
+  function pinSite(parent, path) { return parent + VIA_SEP + path; }
+
+  // 記下「這個 repo 在這棵樹裡被釘在這個版本，而且是誰釘的」。
+  // 同一個版本被兩個上層釘住要各記一筆，所以呼叫點必須在「掃過就跳過」之前。
+  function noteRef(nodeRefs, nodeVia, job) {
+    var list = nodeRefs[job.repo] || (nodeRefs[job.repo] = []);
+    if (list.indexOf(job.ref) === -1) list.push(job.ref);
+    if (!job.via) return;
+    var k = job.repo + '@' + job.ref;
+    var vias = nodeVia[k] || (nodeVia[k] = []);
+    if (vias.indexOf(job.via) === -1) vias.push(job.via);
+  }
+
   // 只要每個 repo 解析出來的版本，不需要邊與落後量，所以比完整分析便宜很多
   function resolveTree(root, ref) {
-    var scanned = {}, queue = [{ repo: root, ref: ref }], nodeRefs = {}, MAX = 26;
+    var scanned = {}, queue = [{ repo: root, ref: ref, via: '' }];
+    var nodeRefs = {}, nodeVia = {}, MAX = 26;
+    function done() { return { nodeRefs: nodeRefs, nodeVia: nodeVia }; }
 
     function step() {
-      if (!queue.length) return Promise.resolve(nodeRefs);
+      if (!queue.length) return Promise.resolve(done());
       var job = queue.shift();
       var key = job.repo + '@' + job.ref;
+      if (!scanned[key] && Object.keys(scanned).length >= MAX) {
+        queue.length = 0; return Promise.resolve(done());
+      }
+      noteRef(nodeRefs, nodeVia, job);
       if (scanned[key]) return step();
-      if (Object.keys(scanned).length >= MAX) { queue.length = 0; return Promise.resolve(nodeRefs); }
       scanned[key] = 1;
-
-      nodeRefs[job.repo] = nodeRefs[job.repo] || [];
-      if (nodeRefs[job.repo].indexOf(job.ref) === -1) nodeRefs[job.repo].push(job.ref);
       banner('讀取比較版本：' + shortName(job.repo) + ' @ ' + shortRef(job.ref), 'info');
 
       return Promise.all([
@@ -1615,15 +1634,19 @@
         raw(job.repo, job.ref, 'Cargo.toml')
       ]).then(function (out) {
         var subs = parseGitmodules(out[0]);
-        parseCargoGit(out[1]).forEach(function (d) {
-          if (trackedRepo(d.repo) && d.sha) queue.push({ repo: d.repo, ref: d.sha });
+        parseCargoGit(out[1]).forEach(function (dep) {
+          if (trackedRepo(dep.repo) && dep.sha) {
+            queue.push({ repo: dep.repo, ref: dep.sha, via: pinSite(job.repo, dep.crate) });
+          }
         });
         return series(subs, function (sm) {
           var target = repoFromUrl(sm.url);
           if (!target || !trackedRepo(target)) return Promise.resolve();
           return gh('/repos/' + job.repo + '/contents/' + sm.path, { ref: job.ref })
             .then(function (c) {
-              if (c && !Array.isArray(c) && c.sha) queue.push({ repo: target, ref: c.sha });
+              if (c && !Array.isArray(c) && c.sha) {
+                queue.push({ repo: target, ref: c.sha, via: pinSite(job.repo, sm.path) });
+              }
             }, function () { /* 拿不到就算了 */ });
         });
       }).then(step);
@@ -1636,65 +1659,104 @@
     return (d && d.shaTag && d.shaTag[r]) || shortRef(r);
   }
 
-  // 同一個 repo 可能被好幾個上層釘在不同版本，所以是一組版本而不是一個。
-  // 排序過再接起來，兩邊才不會因為順序不同就被誤判成有變動。
-  function refsText(list) {
-    if (!list || !list.length) return '—';
-    var seen = {}, out = [];
-    list.map(refName).forEach(function (v) {
-      if (!seen[v]) { seen[v] = 1; out.push(v); }
+  // 把一棵樹攤成「一列一個釘住點」：key 是 repo + 釘住點，值是那邊解出來的版本。
+  // 兩棵樹用同一組 key，同一個釘住點就能直接左右對照。
+  function collectPins(side, into, field) {
+    Object.keys(side.nodeRefs || {}).forEach(function (repo) {
+      (side.nodeRefs[repo] || []).forEach(function (r) {
+        var vias = (side.nodeVia || {})[repo + '@' + r];
+        if (!vias || !vias.length) vias = ['']; // 起點自己沒有上層
+        vias.forEach(function (via) {
+          var k = repo + VIA_SEP + via;
+          var row = into[k] || (into[k] = { repo: repo, via: via, a: [], b: [] });
+          var name = refName(r);
+          if (row[field].indexOf(name) === -1) row[field].push(name);
+        });
+      });
     });
-    return out.sort().join('、');
   }
 
   function renderDiff(d) {
     var cmp = d.compare;
     if (!cmp) {
       return '<p class="deps-empty">上面的「比較」選一個版本，再按「重新分析」，' +
-        '這裡就會一列一個 repo，列出兩個版本各自綁到哪一版。</p>';
+        '這裡就會一列一個釘住點，列出兩個版本各自綁到哪一版。</p>';
     }
-    var repos = {};
-    Object.keys(d.nodeRefs || {}).forEach(function (k) { repos[k] = 1; });
-    Object.keys(cmp.nodeRefs || {}).forEach(function (k) { repos[k] = 1; });
 
-    var rows = Object.keys(repos).filter(function (k) {
-      return !state.depsHidden[k];
-    }).map(function (k) {
-      var a = refsText((d.nodeRefs || {})[k]), b = refsText((cmp.nodeRefs || {})[k]);
-      return { repo: k, a: a, b: b, root: k === d.root, changed: a !== b };
+    var map = {};
+    collectPins(d, map, 'a');
+    collectPins(cmp, map, 'b');
+
+    var rows = Object.keys(map).map(function (k) { return map[k]; })
+      .filter(function (r) { return !state.depsHidden[r.repo]; })
+      .map(function (r) {
+        var parent = r.via ? r.via.split(VIA_SEP)[0] : '';
+        var a = r.a.slice().sort().join('、'), b = r.b.slice().sort().join('、');
+        return {
+          repo: r.repo, root: !r.via, parent: parent,
+          path: r.via ? r.via.split(VIA_SEP)[1] : '',
+          a: a, b: b,
+          st: !b ? 'added' : !a ? 'removed' : a !== b ? 'moved' : 'same',
+          // 一格裡有兩個版本，是因為釘它的那個上層自己在這棵樹裡就有兩個版本
+          split: Math.max(r.a.length, r.b.length) > 1 ? parent : ''
+        };
+      });
+
+    // 依 repo 分組，組內按釘住點排；有變動的組排前面，起點永遠第一
+    var group = {};
+    rows.forEach(function (r) {
+      var g = group[r.repo] || (group[r.repo] = { repo: r.repo, rows: [], moved: false, root: false });
+      g.rows.push(r);
+      if (r.st !== 'same') g.moved = true;
+      if (r.root) g.root = true;
     });
-    // 起點自己放第一列當標題列，後面有動的排前面
-    rows.sort(function (x, y) {
-      return (y.root - x.root) || (y.changed - x.changed) || x.repo.localeCompare(y.repo);
+    var groups = Object.keys(group).map(function (k) { return group[k]; });
+    groups.sort(function (x, y) {
+      return (y.root - x.root) || (y.moved - x.moved) || x.repo.localeCompare(y.repo);
+    });
+    groups.forEach(function (g) {
+      g.rows.sort(function (x, y) { return (x.parent + x.path).localeCompare(y.parent + y.path); });
     });
 
-    var body = rows.filter(function (r) { return !r.root; });
-    var moved = body.filter(function (r) { return r.changed; }).length;
+    var body = groups.filter(function (g) { return !g.root; });
+    var moved = body.filter(function (g) { return g.moved; }).length;
     var same = body.length - moved;
+    var pins = rows.filter(function (r) { return !r.root; }).length;
 
     var html = '<p class="diff-lead">' +
       esc(shortName(d.root)) + ' 從 <b>' + esc(refName(cmp.rootRef)) + '</b> 換到 <b>' +
-      esc(refName(d.rootRef)) + '</b>：' +
-      (moved ? '底下 <b>' + moved + ' 個 repo 跟著換了版本</b>，另外 ' + same + ' 個沒動'
-             : '底下 ' + same + ' 個 repo 綁的版本完全一樣') + '</p>';
+      esc(refName(d.rootRef)) + '</b>：底下 ' + body.length + ' 個 repo、' + pins + ' 個釘住點，' +
+      (moved ? '其中 <b>' + moved + ' 個 repo 跟著換了版本</b>，另外 ' + same + ' 個沒動'
+             : '綁的版本完全一樣') + '</p>';
+
+    var LABEL = { added: '新增', removed: '移除', moved: '換了版本', same: '沒動' };
+    var PILL = { added: 'behind', removed: 'diverged', moved: 'behind', same: 'sync' };
 
     html += '<div class="tablewrap"><table class="dep-table diff-table"><thead><tr>' +
-      '<th>Repo</th><th>' + esc(refName(cmp.rootRef)) + '</th><th></th><th>' +
+      '<th>Repo</th><th>誰把它釘住的</th><th>' + esc(refName(cmp.rootRef)) + '</th><th></th><th>' +
       esc(refName(d.rootRef)) + '</th><th>狀態</th></tr></thead><tbody>';
-    rows.forEach(function (r) {
-      var pill = r.root ? '<span class="dep-pill unknown">起點</span>'
-        : r.changed ? '<span class="dep-pill behind">換了版本</span>'
-        : '<span class="dep-pill sync">沒動</span>';
-      html += '<tr class="' + (r.root ? 'rootrow' : r.changed ? 'moved' : 'same') + '">' +
-        '<td class="m">' + esc(shortName(r.repo)) + '</td>' +
-        '<td class="m old">' + esc(r.b) + '</td>' +
-        '<td class="arrow">' + (r.changed ? '→' : '') + '</td>' +
-        '<td class="m new">' + esc(r.a) + '</td>' +
-        '<td>' + pill + '</td>' +
-      '</tr>';
+
+    groups.forEach(function (g) {
+      g.rows.forEach(function (r, i) {
+        html += '<tr class="' + (r.root ? 'rootrow' : r.st) + (i ? ' cont' : ' gstart') + '">' +
+          '<td class="m repo">' + (i ? '' : esc(shortName(r.repo))) + '</td>' +
+          '<td class="via">' + (r.root
+            ? '<span class="via-me">你選的起點</span>'
+            : '<b>' + esc(shortName(r.parent)) + '</b>' +
+              '<span class="via-path">' + esc(r.path) + '</span>' +
+              (r.split ? '<span class="sub">' + esc(shortName(r.split)) +
+                 ' 自己在這棵樹裡就有兩個版本，所以這裡也是兩個</span>' : '')) + '</td>' +
+          '<td class="m old">' + esc(r.b || '—') + '</td>' +
+          '<td class="arrow">' + (r.st === 'same' ? '' : '→') + '</td>' +
+          '<td class="m new">' + esc(r.a || '—') + '</td>' +
+          '<td>' + (r.root ? '<span class="dep-pill unknown">起點</span>'
+                           : '<span class="dep-pill ' + PILL[r.st] + '">' + LABEL[r.st] + '</span>') +
+          '</td></tr>';
+      });
     });
     html += '</tbody></table></div>';
-    html += '<p class="diff-foot">一格裡有兩個以上的版本，代表這個 repo 同時被不同的上層釘在不同 commit。</p>';
+    html += '<p class="diff-foot">同一個 repo 佔好幾列，代表它同時被好幾個地方釘住，' +
+      '那幾個地方各釘各的版本，本來就不一定一致 —— 「誰把它釘住的」那欄就是差別的來源。</p>';
     return html;
   }
 

@@ -627,20 +627,35 @@ body.no-scroll { overflow: hidden; }
 .g-key.muted i { opacity: .35; }
 
 /* ---------- 版本比較 ---------- */
-.diff-lead {
-  margin: 12px 0 0; font-size: 13px; color: var(--ink-2);
-}
+.diff-lead { margin: 12px 0 0; font-size: 13px; color: var(--ink-2); }
 .diff-lead b { color: var(--ink); font-weight: 600; }
-.diff-table { min-width: 620px; }
+.diff-foot { margin: 8px 0 0; font-size: 12px; color: var(--muted); }
+
+.diff-table { min-width: 760px; }
+/* 同一個 repo 的多個釘住點是連在一起的一組，只有組的第一列畫分隔線 */
+.diff-table tbody tr td { border-bottom: none; }
+.diff-table tbody tr.gstart td { border-top: 1px solid var(--grid); }
+.diff-table tbody tr.gstart:first-child td { border-top: none; }
+.diff-table td.repo { font-weight: 600; }
+.diff-table td.via { font-size: 12px; color: var(--ink-2); }
+.diff-table td.via b {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-weight: 600; color: var(--ink-2);
+}
+.diff-table td.via .via-path {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--muted); margin-left: 8px;
+}
+.diff-table td.via .via-me { color: var(--muted); }
 .diff-table td.arrow {
   width: 1%; text-align: center; color: var(--muted); padding-left: 6px; padding-right: 6px;
 }
-/* 舊版本靠右，跟箭頭、新版本連成一行，一眼看得出誰換成誰 */
-.diff-table td.old, .diff-table thead th:nth-child(2) { text-align: right; }
+.diff-table td.old, .diff-table thead th:nth-child(3) { text-align: right; }
 .diff-table thead th:last-child, .diff-table tbody td:last-child { width: 1%; white-space: nowrap; }
-.diff-table tr.moved td { background: color-mix(in srgb, var(--warn) 8%, transparent); }
-.diff-table tr.moved td.new { color: var(--ink); font-weight: 600; }
+.diff-table tr.moved td, .diff-table tr.added td, .diff-table tr.removed td {
+  background: color-mix(in srgb, var(--warn) 8%, transparent);
+}
+.diff-table tr.moved td.new, .diff-table tr.added td.new { color: var(--ink); font-weight: 600; }
 .diff-table tr.moved td.old { color: var(--muted); }
 .diff-table tr.same td.m.old, .diff-table tr.same td.m.new { color: var(--muted); }
 .diff-table tr.rootrow td { background: var(--plane); font-weight: 600; }
-.diff-foot { margin: 8px 0 0; font-size: 12px; color: var(--muted); }
