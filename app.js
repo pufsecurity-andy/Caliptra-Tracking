@@ -1010,7 +1010,7 @@
       var text = list.length > 2
         ? list.slice(0, 2).join(' / ') + ' +' + (list.length - 2)
         : list.join(' / ');
-      if (text.length > 34) text = text.slice(0, 33) + '…';
+      if (text.length > 24) text = text.slice(0, 23) + '…';
       if (text) return text;
     }
     return repoVersion(fullName) || '沒有 tag';
@@ -1062,7 +1062,15 @@
   // 分層 + 在中間層補虛擬節點，長線才有辦法從節點之間穿過去，
   // 而不是全部繞到畫布外側把中間塞滿橫線。
   function layeredLayout(edges) {
-    var GAP = 24, ROW = 104, BH = 44, PAD = 20, DW = 10;
+    var GAP = 30, DGAP = 14, ROW = 112, BH = 52, PAD = 24, DW = 8, MAXW = 208;
+    function gapOf(a, b) {
+      return (a.kind === 'dummy' || b.kind === 'dummy') ? DGAP : GAP;
+    }
+    function layerWidth(L) {
+      var w = 0;
+      L.forEach(function (it, i) { w += it.w; if (i) w += gapOf(L[i - 1], it); });
+      return w;
+    }
 
     // 1. 分層：沒有往外相依的排最底層；遇到環就地切斷
     var ids = {}, out = {};
@@ -1090,7 +1098,8 @@
       // 寬度要同時容得下名稱與版本字串，否則版本會凸出框外
       var it = {
         key: id, kind: 'node', id: id, rank: rank[id],
-        w: Math.max(124, shortName(id).length * 7.3 + 22, nodeVersion(id).length * 6.7 + 22),
+        w: Math.min(MAXW,
+             Math.max(132, shortName(id).length * 7.4 + 30, nodeVersion(id).length * 6.5 + 30)),
         up: [], down: []
       };
       items[id] = it;
@@ -1134,15 +1143,15 @@
 
     // 4. 先平均攤開，再把長線往直的方向拉
     var need = 0;
-    layers.forEach(function (L) {
-      var w = L.reduce(function (a, it) { return a + it.w; }, 0) + GAP * Math.max(0, L.length - 1);
-      need = Math.max(need, w);
-    });
+    layers.forEach(function (L) { need = Math.max(need, layerWidth(L)); });
     var W = Math.max(720, need + PAD * 2);
     layers.forEach(function (L) {
-      var total = L.reduce(function (a, it) { return a + it.w; }, 0) + GAP * Math.max(0, L.length - 1);
-      var x = (W - total) / 2;
-      L.forEach(function (it) { it.cx = x + it.w / 2; x += it.w + GAP; });
+      var x = (W - layerWidth(L)) / 2;
+      L.forEach(function (it, i) {
+        if (i) x += gapOf(L[i - 1], it);
+        it.cx = x + it.w / 2;
+        x += it.w;
+      });
     });
 
     function straighten(dir) {
@@ -1157,14 +1166,14 @@
         });
         var prev = null;
         L.forEach(function (it) {
-          var min = prev ? prev.cx + prev.w / 2 + GAP + it.w / 2 : PAD + it.w / 2;
+          var min = prev ? prev.cx + prev.w / 2 + gapOf(prev, it) + it.w / 2 : PAD + it.w / 2;
           it.cx = Math.max(min, it.want);
           prev = it;
         });
         for (var j = L.length - 1; j >= 0; j--) {
           var it2 = L[j], right = L[j + 1], left = L[j - 1];
-          var hi = right ? right.cx - right.w / 2 - GAP - it2.w / 2 : Infinity;
-          var lo = left ? left.cx + left.w / 2 + GAP + it2.w / 2 : PAD + it2.w / 2;
+          var hi = right ? right.cx - right.w / 2 - gapOf(it2, right) - it2.w / 2 : Infinity;
+          var lo = left ? left.cx + left.w / 2 + gapOf(left, it2) + it2.w / 2 : PAD + it2.w / 2;
           it2.cx = Math.min(hi, Math.max(lo, Math.min(it2.want, hi)));
         }
       });
@@ -1190,27 +1199,82 @@
       L.forEach(function (it) { it.y = PAD + (maxRank - it.rank) * ROW; });
     });
 
+    // 同一個節點的多條線，出線點沿底邊、入線點沿頂邊平均分開，
+    // 不要全部擠在中心點射出去
+    var outMap = {}, inMap = {};
+    chains.forEach(function (c) {
+      var a = c.chain[0], b = c.chain[c.chain.length - 1];
+      (outMap[a.key] = outMap[a.key] || []).push(c);
+      (inMap[b.key] = inMap[b.key] || []).push(c);
+    });
+    function spread(map, which, pick) {
+      Object.keys(map).forEach(function (k) {
+        var list = map[k], node = items[k];
+        if (!node) return;
+        list.sort(function (p, q) { return pick(p) - pick(q); });
+        var span = Math.min(node.w - 30, Math.max(0, (list.length - 1) * 22));
+        list.forEach(function (c, i) {
+          c[which] = list.length === 1
+            ? node.cx
+            : node.cx - span / 2 + span * i / (list.length - 1);
+        });
+      });
+    }
+    spread(outMap, 'exitX', function (c) { return c.chain[1].cx; });
+    spread(inMap, 'entryX', function (c) { return c.chain[c.chain.length - 2].cx; });
+
     return {
       layers: layers, chains: chains, items: items,
       W: W, H: PAD * 2 + maxRank * ROW + BH, BH: BH
     };
   }
 
-  // 折線轉成有圓角的路徑
+  function r1(n) { return Math.round(n * 10) / 10; }
+
+  // 把路徑點轉成直角折線：往下 → 橫移 → 再往下。
+  // jog 是橫移發生的高度，同一個節點出來的多條線各自錯開，橫線才不會疊在一起。
+  function orthogonalize(pts, jog) {
+    var out = [{ x: pts[0].x, y: pts[0].y }];
+    for (var i = 1; i < pts.length; i++) {
+      var a = out[out.length - 1], b = pts[i];
+      if (Math.abs(a.x - b.x) > 1.5) {
+        var mid = (a.y + b.y) / 2 + jog;
+        mid = Math.max(a.y + 10, Math.min(b.y - 10, mid));
+        out.push({ x: a.x, y: mid }, { x: b.x, y: mid });
+      }
+      out.push({ x: b.x, y: b.y });
+    }
+    // 去掉重複與同一直線上的多餘點
+    var clean = [out[0]];
+    for (var j = 1; j < out.length; j++) {
+      var p = out[j], q = clean[clean.length - 1];
+      if (Math.abs(p.x - q.x) < 0.5 && Math.abs(p.y - q.y) < 0.5) continue;
+      if (clean.length >= 2) {
+        var o = clean[clean.length - 2];
+        var sameV = Math.abs(o.x - q.x) < 0.5 && Math.abs(q.x - p.x) < 0.5;
+        var sameH = Math.abs(o.y - q.y) < 0.5 && Math.abs(q.y - p.y) < 0.5;
+        if (sameV || sameH) { clean[clean.length - 1] = p; continue; }
+      }
+      clean.push(p);
+    }
+    return clean;
+  }
+
+  // 折線轉成帶圓角的路徑
   function roundedPath(pts, r) {
     if (pts.length < 2) return '';
-    if (pts.length === 2) return 'M' + pts[0].x + ' ' + pts[0].y + ' L' + pts[1].x + ' ' + pts[1].y;
-    var d = 'M' + pts[0].x + ' ' + pts[0].y;
+    var d = 'M' + r1(pts[0].x) + ' ' + r1(pts[0].y);
     for (var i = 1; i < pts.length - 1; i++) {
       var p = pts[i], a = pts[i - 1], b = pts[i + 1];
       var d1 = Math.hypot(p.x - a.x, p.y - a.y) || 1;
       var d2 = Math.hypot(b.x - p.x, b.y - p.y) || 1;
-      var l1 = Math.min(r, d1 / 2), l2 = Math.min(r, d2 / 2);
-      d += ' L' + (p.x + (a.x - p.x) / d1 * l1) + ' ' + (p.y + (a.y - p.y) / d1 * l1) +
-           ' Q' + p.x + ' ' + p.y + ' ' + (p.x + (b.x - p.x) / d2 * l2) + ' ' + (p.y + (b.y - p.y) / d2 * l2);
+      var rr = Math.min(r, d1 / 2, d2 / 2);
+      d += ' L' + r1(p.x + (a.x - p.x) / d1 * rr) + ' ' + r1(p.y + (a.y - p.y) / d1 * rr) +
+           ' Q' + r1(p.x) + ' ' + r1(p.y) + ' ' +
+           r1(p.x + (b.x - p.x) / d2 * rr) + ' ' + r1(p.y + (b.y - p.y) / d2 * rr);
     }
     var last = pts[pts.length - 1];
-    return d + ' L' + last.x + ' ' + last.y;
+    return d + ' L' + r1(last.x) + ' ' + r1(last.y);
   }
 
   function depsGraphSvg(edges) {
@@ -1233,21 +1297,28 @@
       esc('相依關係圖：' + Object.keys(G.items).length + ' 個 repo、' + G.chains.length + ' 條相依') +
       '"><defs>' +
       ['sync', 'behind', 'diverged', 'unknown'].map(function (kk) {
-        return '<marker id="gm-' + kk + '" viewBox="0 0 10 10" refX="9.5" refY="5" ' +
-          'markerWidth="8" markerHeight="8" orient="auto-start-reverse">' +
-          '<path class="gm ' + kk + '" d="M0.5 1 L9.5 5 L0.5 9 z"/></marker>';
+        return '<marker id="gm-' + kk + '" viewBox="0 0 10 10" refX="9" refY="5" ' +
+          'markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">' +
+          '<path class="gm ' + kk + '" d="M1 1.5 L9 5 L1 8.5 z"/></marker>';
       }).join('') + '</defs>';
 
-    var edgeSvg = '', labels = [];
-    G.chains.forEach(function (c) {
+    var edgeSvg = '', labels = [], labelled = {};
+    G.chains.forEach(function (c, ci) {
       var e = c.edge, st = edgeState(e), pin = pinLabel(e);
-      var pts = c.chain.map(function (it, i) {
-        if (i === 0) return { x: it.cx, y: it.y + G.BH };              // 從來源底部出發
-        if (i === c.chain.length - 1) return { x: it.cx, y: it.y };    // 進到目標頂部
-        return { x: it.cx, y: it.y + G.BH / 2 };                       // 穿過中間層
+      var dupKey = e.to + '@' + pin;
+      var jog = ((ci * 3) % 5 - 2) * 8;   // -16 / -8 / 0 / 8 / 16
+      // 虛擬節點給上下兩個點：橫移只會發生在層與層之間的空隙，
+      // 穿過節點那一排時一定是純垂直線，不會有橫線切過節點框。
+      var pts = [];
+      c.chain.forEach(function (it, i) {
+        if (i === 0) { pts.push({ x: c.exitX, y: it.y + G.BH }); return; }            // 來源底部
+        if (i === c.chain.length - 1) { pts.push({ x: c.entryX, y: it.y - 6 }); return; } // 目標上方留空隙
+        pts.push({ x: it.cx, y: it.y }, { x: it.cx, y: it.y + G.BH });         // 穿過中間層
       });
 
-      edgeSvg += '<path class="g-edge ' + st.cls + '" d="' + roundedPath(pts, 14) +
+      var route = orthogonalize(pts, jog);
+      edgeSvg += '<path class="g-edge ' + st.cls + '" d="' + roundedPath(route, 11) +
+        '" data-from="' + esc(e.from) + '" data-to="' + esc(e.to) + '" data-lk="' + esc(dupKey) +
         '" marker-end="url(#gm-' + st.cls + ')"><title>' +
         esc(shortName(e.from) + ' → ' + shortName(e.to) + '\n' +
             (e.kind === 'submodule' ? 'submodule ' : 'Cargo ') + e.ref +
@@ -1256,30 +1327,88 @@
         '</title></path>';
 
       // 只標需要注意的那些，全部都標會糊成一片
-      if (st.cls !== 'sync' && pin && pin !== '—') {
-        var mid = pts.length > 2 ? pts[Math.floor(pts.length / 2)]
-                                 : { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 };
-        labels.push({ x: mid.x, y: mid.y, w: pin.length * 6.1 + 10, text: pin, cls: st.cls });
+      // 同一個目標釘同一版就只標一次，重複的標籤只是噪音
+      if (st.cls !== 'sync' && pin && pin !== '—' && !labelled[dupKey]) {
+        labelled[dupKey] = 1;
+        // 貼在最長的垂直段上：標籤永遠在線上，不會飄到旁邊
+        var verticals = [];
+        for (var si = 1; si < route.length; si++) {
+          var a = route[si - 1], b = route[si];
+          if (Math.abs(a.x - b.x) < 0.6) {
+            verticals.push({ x: a.x, lo: Math.min(a.y, b.y), hi: Math.max(a.y, b.y),
+                             len: Math.abs(b.y - a.y) });
+          }
+        }
+        verticals.sort(function (p, q) { return q.len - p.len; });
+        var best = verticals[0] || null;
+        if (best && best.len > 26) {
+          labels.push({
+            x: best.x, y: (best.lo + best.hi) / 2, lo: best.lo + 12, hi: best.hi - 12,
+            runs: verticals, w: pin.length * 6.0 + 16, text: pin, cls: st.cls, lk: dupKey
+          });
+        }
       }
     });
 
-    // 標籤互相避讓：跟已放好的重疊就上下挪一點
-    labels.forEach(function (L, i) {
-      for (var a = 0; a < 14; a++) {
-        var hit = false;
-        for (var j = 0; j < i; j++) {
-          var o = labels[j];
-          if (Math.abs(L.x - o.x) < (L.w + o.w) / 2 + 5 && Math.abs(L.y - o.y) < 18) { hit = true; break; }
+    // 標籤避讓：不只要閃開其他標籤，也不能壓在節點框上
+    var boxes = [];
+    G.layers.forEach(function (L) {
+      L.forEach(function (it) {
+        if (it.kind === 'node') {
+          boxes.push({ x: it.cx, y: it.y + G.BH / 2, w: it.w, h: G.BH });
         }
-        if (!hit) break;
-        L.y += (a % 2 ? -1 : 1) * (11 + a * 4);
+      });
+    });
+    function clash(L, upto) {
+      var j;
+      for (j = 0; j < upto; j++) {
+        var o = labels[j];
+        if (Math.abs(L.x - o.x) < (L.w + o.w) / 2 + 6 && Math.abs(L.y - o.y) < 20) return true;
       }
+      for (j = 0; j < boxes.length; j++) {
+        var b = boxes[j];
+        if (Math.abs(L.x - b.x) < (L.w + b.w) / 2 + 4 &&
+            Math.abs(L.y - b.y) < (18 + b.h) / 2 + 4) return true;
+      }
+      return false;
+    }
+    labels.forEach(function (L, i) {
+      if (!clash(L, i)) return;
+      var baseY = L.y, baseX = L.x, step, d, k, cands;
+
+      // 依序試遍這條線的每一段垂直線，上下滑動找空位
+      for (var ri = 0; ri < L.runs.length; ri++) {
+        var run = L.runs[ri];
+        if (run.len < 26) continue;
+        L.x = run.x;
+        var mid = (run.lo + run.hi) / 2, lo = run.lo + 12, hi = run.hi - 12;
+        for (step = 0; step <= 12; step++) {
+          d = step * 11;
+          cands = (step ? [mid - d, mid + d] : [mid]).filter(function (y) { return y >= lo && y <= hi; });
+          for (k = 0; k < cands.length; k++) {
+            L.y = cands[k];
+            if (!clash(L, i)) return;
+          }
+        }
+      }
+      L.x = baseX;
+      // 還是擺不下就靠到線的側邊，貼著線仍然讀得出是哪一條
+      var side = L.w / 2 + 12;
+      for (step = 0; step <= 8; step++) {
+        d = step * 13;
+        for (k = 0; k < 4; k++) {
+          L.x = baseX + (k % 2 ? side : -side);
+          L.y = Math.max(L.lo, Math.min(L.hi, baseY + (k < 2 ? -d : d)));
+          if (!clash(L, i)) return;
+        }
+      }
+      L.x = baseX; L.y = baseY;
     });
 
     svg += edgeSvg + labels.map(function (L) {
-      return '<g class="g-pin-g"><rect class="g-pin-bg" x="' + (L.x - L.w / 2) + '" y="' + (L.y - 8) +
-        '" width="' + L.w + '" height="15" rx="4"/>' +
-        '<text class="g-pin ' + L.cls + '" x="' + L.x + '" y="' + (L.y + 3.5) +
+      return '<g class="g-pin-g" data-lk="' + esc(L.lk) + '"><rect class="g-pin-bg ' + L.cls + '" x="' + r1(L.x - L.w / 2) +
+        '" y="' + r1(L.y - 9) + '" width="' + r1(L.w) + '" height="18" rx="9"/>' +
+        '<text class="g-pin" x="' + r1(L.x) + '" y="' + r1(L.y + 3.5) +
         '" text-anchor="middle">' + esc(L.text) + '</text></g>';
     }).join('');
 
@@ -1288,14 +1417,14 @@
         if (it.kind !== 'node') return;
         var ver = nodeVersion(it.id);
         var full = nodeVersionsFull(it.id);
-        svg += '<g class="g-node"><title>' +
+        svg += '<g class="g-node" data-id="' + esc(it.id) + '"><title>' +
           esc(shortName(it.id) + '\n' + (state.deps && state.deps.root ? '這個版本綁到：' : '最新版本：') + full) +
           '</title>' +
           '<rect class="g-box" x="' + (it.cx - it.w / 2) + '" y="' + it.y +
           '" width="' + it.w + '" height="' + G.BH + '" rx="6"/>' +
-          '<text class="g-name" x="' + it.cx + '" y="' + (it.y + 19) + '" text-anchor="middle">' +
+          '<text class="g-name" x="' + it.cx + '" y="' + (it.y + 22) + '" text-anchor="middle">' +
           esc(shortName(it.id)) + '</text>' +
-          '<text class="g-ver" x="' + it.cx + '" y="' + (it.y + 34) + '" text-anchor="middle">' +
+          '<text class="g-ver" x="' + it.cx + '" y="' + (it.y + 38) + '" text-anchor="middle">' +
           esc(ver) + '</text></g>';
       });
     });
@@ -1311,7 +1440,7 @@
       ['unknown', '沒量到']
     ].map(function (x) {
       return '<span class="g-key"><i class="' + x[0] + '"></i>' + esc(x[1]) + '</span>';
-    }).join('') + '<span class="g-hint">綠線沒問題所以不標字；其餘標的是釘住的版本，滑過線或節點看細節</span></div>';
+    }).join('') + '<span class="g-hint">滑到任一節點只亮它相關的線；綠線沒問題所以不標字</span></div>';
   }
 
   /* ---------- 起點 / 版本 / 顯示哪些 repo ---------- */
@@ -1759,6 +1888,33 @@
       $(sel).addEventListener('change', render);
     });
     $('#show-archived').addEventListener('change', fetchMissing);
+    // 滑到節點就只亮跟它有關的線，其餘淡出 —— 線一多的時候這比再怎麼排版都有效
+    $('#deps-body').addEventListener('mouseover', function (ev) {
+      var svg = $('#deps-body .dep-graph');
+      if (!svg) return;
+      var node = ev.target.closest && ev.target.closest('.g-node');
+      if (!node) return;
+      var id = node.getAttribute('data-id');
+      svg.classList.add('focusing');
+      var keep = {};
+      svg.querySelectorAll('.g-edge').forEach(function (path) {
+        var from = path.getAttribute('data-from'), to = path.getAttribute('data-to');
+        var hit = from === id || to === id;
+        path.classList.toggle('on', hit);
+        if (hit) { keep[from] = keep[to] = 1; keep['lk:' + path.getAttribute('data-lk')] = 1; }
+      });
+      svg.querySelectorAll('.g-node').forEach(function (n) {
+        n.classList.toggle('on', !!keep[n.getAttribute('data-id')]);
+      });
+      svg.querySelectorAll('.g-pin-g').forEach(function (g) {
+        g.classList.toggle('on', !!keep['lk:' + g.getAttribute('data-lk')]);
+      });
+    });
+    $('#deps-body').addEventListener('mouseleave', function () {
+      var svg = $('#deps-body .dep-graph');
+      if (svg) svg.classList.remove('focusing');
+    });
+
     $('#btn-refs-reload').addEventListener('click', function () {
       loadRefsFor(state.depsRoot, true);
     });

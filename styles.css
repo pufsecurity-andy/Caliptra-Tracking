@@ -26,6 +26,7 @@
   --del-ink:    #8e2626;
   --hunk-ink:   #184f95;
   --scrim:      rgba(11, 11, 11, .38);
+  --sync-alpha: .45;
   --info-bg:    #e8f0fd;
   --info-ink:   #184f95;
   --error-bg:   #fbe6e6;
@@ -55,6 +56,8 @@
     --del-ink:    #f0a3a3;
     --hunk-ink:   #86b6ef;
     --scrim:      rgba(0, 0, 0, .62);
+  --sync-alpha: .78;
+    --sync-alpha: .78;
     --info-bg:    #16283f;
     --info-ink:   #9ec5f4;
     --error-bg:   #3b1a1a;
@@ -83,6 +86,7 @@
   --del-ink:    #f0a3a3;
   --hunk-ink:   #86b6ef;
   --scrim:      rgba(0, 0, 0, .62);
+  --sync-alpha: .78;
   --info-bg:    #16283f;
   --info-ink:   #9ec5f4;
   --error-bg:   #3b1a1a;
@@ -512,51 +516,68 @@ body.no-scroll { overflow: hidden; }
 .seg:hover:not(.on) { color: var(--accent); }
 
 .graphwrap {
-  margin-top: 12px; padding: 8px 4px;
-  border: 1px solid var(--border); border-radius: 8px;
+  margin-top: 14px; padding: 14px 10px 10px;
+  border: 1px solid var(--grid); border-radius: 10px;
   background: var(--plane); overflow-x: auto;
 }
-.dep-graph { display: block; width: 100%; height: auto; min-width: 640px; }
+.dep-graph { display: block; width: 100%; height: auto; min-width: 620px; }
 
-.g-box { fill: var(--surface); stroke: var(--muted); stroke-opacity: .4; }
+/* 節點 */
+.g-box {
+  fill: var(--surface); stroke: var(--ink); stroke-opacity: .16; stroke-width: 1;
+}
 .g-name {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 12px; font-weight: 600; fill: var(--ink);
+  font-size: 12.5px; font-weight: 600; fill: var(--ink); letter-spacing: -.2px;
 }
 .g-ver {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 10px; fill: var(--muted);
+  font-size: 10px; fill: var(--muted); letter-spacing: -.1px;
 }
-.g-edge { fill: none; stroke-width: 1.8; }
-.g-edge.sync     { stroke: var(--ok); }
+
+/* 線：綠色代表沒事，要退到背景去；有問題的才跳出來 */
+.g-edge { fill: none; stroke-width: 1.6; stroke-linecap: round; }
+.g-edge.sync     { stroke: var(--ok); stroke-opacity: var(--sync-alpha); stroke-width: 1.4; }
 .g-edge.behind   { stroke: var(--warn); }
 .g-edge.diverged { stroke: var(--accent); }
-.g-edge.unknown  { stroke: var(--muted); }
-.gm.sync     { fill: var(--ok); }
+.g-edge.unknown  { stroke: var(--muted); stroke-opacity: .6; }
+.gm.sync     { fill: var(--ok); fill-opacity: var(--sync-alpha); }
 .gm.behind   { fill: var(--warn); }
 .gm.diverged { fill: var(--accent); }
-.gm.unknown  { fill: var(--muted); }
-.g-pin-bg { fill: var(--plane); }
+.gm.unknown  { fill: var(--muted); fill-opacity: .7; }
+
+/* 線上的版本標籤：安靜的膠囊，顏色只留在外框 */
+.g-pin-bg { fill: var(--surface); stroke-width: 1; stroke-opacity: .45; }
+.g-pin-bg.sync     { stroke: var(--ok); }
+.g-pin-bg.behind   { stroke: var(--warn); }
+.g-pin-bg.diverged { stroke: var(--accent); }
+.g-pin-bg.unknown  { stroke: var(--muted); }
 .g-pin {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 10px; font-weight: 600;
+  font-size: 9.5px; font-weight: 500; fill: var(--ink-2); letter-spacing: -.1px;
 }
-.g-pin.sync     { fill: var(--ok); }
-.g-pin.behind   { fill: var(--warn); }
-.g-pin.diverged { fill: var(--accent); }
-.g-pin.unknown  { fill: var(--muted); }
+
+/* 滑過節點時聚焦：不相關的線與節點淡出 */
+.dep-graph .g-edge, .dep-graph .g-node, .dep-graph .g-pin-g { transition: opacity .12s ease; }
+.dep-graph.focusing .g-edge,
+.dep-graph.focusing .g-node,
+.dep-graph.focusing .g-pin-g { opacity: .12; }
+.dep-graph.focusing .g-edge.on,
+.dep-graph.focusing .g-node.on,
+.dep-graph.focusing .g-pin-g.on { opacity: 1; }
+.dep-graph .g-node { cursor: default; }
 
 .g-legend {
-  display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: center;
-  margin-top: 10px; font-size: 12px; color: var(--ink-2);
+  display: flex; flex-wrap: wrap; gap: 8px 20px; align-items: center;
+  margin-top: 12px; padding: 0 2px; font-size: 11.5px; color: var(--ink-2);
 }
-.g-key { display: inline-flex; align-items: center; gap: 6px; }
-.g-key i { width: 16px; height: 2px; border-radius: 1px; display: inline-block; }
-.g-key i.sync     { background: var(--ok); }
+.g-key { display: inline-flex; align-items: center; gap: 7px; }
+.g-key i { width: 18px; height: 2px; border-radius: 2px; display: inline-block; }
+.g-key i.sync     { background: var(--ok); opacity: var(--sync-alpha); }
 .g-key i.behind   { background: var(--warn); }
 .g-key i.diverged { background: var(--accent); }
-.g-key i.unknown  { background: var(--muted); }
-.g-hint { color: var(--muted); margin-left: auto; }
+.g-key i.unknown  { background: var(--muted); opacity: .6; }
+.g-hint { color: var(--muted); margin-left: auto; font-size: 11px; }
 
 /* ---------- 起點 / 版本 / repo 篩選 ---------- */
 
@@ -575,22 +596,22 @@ body.no-scroll { overflow: hidden; }
 .ctl-hint.warn { color: var(--warn); font-weight: 600; }
 
 .deps-filter {
-  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
-  margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--grid);
+  display: flex; align-items: center; gap: 7px; flex-wrap: wrap;
+  margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--grid);
 }
 .deps-filter[hidden] { display: none; }
 .f-label { font-size: 11.5px; color: var(--muted); margin-right: 2px; }
 .f-chip {
-  font: inherit; font-size: 11.5px; padding: 3px 9px; border-radius: 999px; cursor: pointer;
+  font: inherit; font-size: 11.5px; padding: 4px 11px; border-radius: 999px; cursor: pointer;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  border: 1px solid var(--border); background: var(--plane);
-  color: var(--muted); text-decoration: line-through;
+  border: 1px dashed var(--border); background: transparent;
+  color: var(--muted); opacity: .75; transition: opacity .12s, border-color .12s;
 }
 .f-chip.on {
-  background: var(--surface); color: var(--ink); text-decoration: none;
-  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+  background: var(--surface); color: var(--ink); opacity: 1;
+  border-style: solid; border-color: var(--border);
 }
-.f-chip:hover { border-color: var(--accent); }
+.f-chip:hover { border-color: var(--accent); opacity: 1; }
 .f-all {
   font: inherit; font-size: 11.5px; padding: 3px 9px; margin-left: 4px;
   border: none; background: none; color: var(--accent); cursor: pointer;
