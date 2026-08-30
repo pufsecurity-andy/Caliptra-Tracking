@@ -68,16 +68,24 @@
 選好起點與版本之後，旁邊的「比較」再選一個版本（例如 `rt-sdk-2.1.0` 對 `rt-sdk-2.0.0`），
 按「重新分析」，右上角會多出「版本比較」頁籤：
 
-| Repo | rt-sdk-2.0.0 | | rt-sdk-2.1.0 | 狀態 |
-|---|---:|---|---|---|
-| caliptra-mcu-sw | rt-sdk-2.0.0 | → | rt-sdk-2.1.0 | 起點 |
-| caliptra-sw | 3b036b4 | → | e5ceee8 | 換了版本 |
-| caliptra-rtl | 521cf31、v2.1.2 | | 521cf31、v2.1.2 | 沒動 |
+| Repo | 誰把它釘住的 | rt-sdk-2.0.0 | | rt-sdk-2.1.0 | 狀態 |
+|---|---|---:|---|---|---|
+| caliptra-mcu-sw | 你選的起點 | rt-sdk-2.0.0 | → | rt-sdk-2.1.0 | 起點 |
+| caliptra-ss | caliptra-mcu-sw `hw/caliptra-ss` | css-v2.0.2 | → | css-v2.1.2 | 換了版本 |
+| | caliptra-sw `hw/latest/caliptra-ss` | css-v2.1.2+1.val.doc | | css-v2.1.2+1.val.doc | 沒動 |
+| | caliptra-sw `hw/rev-2_1/caliptra-ss` | css-v2.1.2 | | css-v2.1.2 | 沒動 |
+| caliptra-sw | caliptra-mcu-sw `caliptra-api` | 3b036b4 | → | e5ceee8 | 換了版本 |
 
-一列一個 repo，換了版本的排在前面並且高亮，沒動的沉到後面。
-一格裡有兩個以上的版本，代表那個 repo 同時被不同的上層釘在不同 commit。
-比較用的那棵樹只解版本、不算落後量，所以比一次完整分析便宜（約 8～12 次 API）。
+一列是一個**釘住點**（某個上層的某個 submodule 路徑或 crate 名），不是一個 repo。
+同一個 repo 佔好幾列，就代表它同時被好幾個地方釘住——那正是為什麼一個 repo 會出現兩個以上的版本。
+`caliptra-ss` 就同時被 `caliptra-mcu-sw` 跟 `caliptra-sw` 的兩條 hw 路徑各釘各的。
+
+有變動的 repo 整組排到前面並且高亮，沒動的沉到後面轉灰。submodule 或 crate 是新加的／被拿掉的，
+會標成「新增」「移除」。比較用的那棵樹只解版本、不算落後量，所以比一次完整分析便宜（約 8～12 次 API）。
 「比較」留空就沒有這個頁籤。
+
+還有一種情形是**上層自己就有兩個版本**：`caliptra-rtl` 被 `caliptra-sw` 跟 `caliptra-ss` 釘在不同 commit，
+它底下的 `adams-bridge` 就會跟著解出兩個版本。那一格會加一行小字說明是哪個上層造成的。
 
 ### 隱藏不想看的 repo
 
